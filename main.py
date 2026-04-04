@@ -2,13 +2,16 @@
 mewhisk — Metaculus forecasting bot
 =====================================
 Agent routing   : AgentRouter (https://agentrouter.org)
-Primary model   : claude-sonnet-4-6   (fast, calibrated)
-Checker model   : claude-opus-4-6     (deep adversarial)
-Research        : perplexity/sonar-pro via AgentRouter
-                  (online model with live web — no extra API keys needed)
+Primary model   : claude-sonnet-4-6       (fast, calibrated)
+Checker model   : claude-opus-4-6         (deep adversarial)
+Research        : perplexity/sonar-pro    (online, live web)  ← primary
+                + openai/gpt-4o-search-preview (online, live web) ← secondary
+                  Both run in parallel, concatenated into one research block.
+                  Override via MEWHISK_RESEARCH_MODEL_1 / _MODEL_2 env vars.
 Extremization   : ON — conservative (k_binary=1.15, k_mc=1.12)
+Concurrency     : 4 questions in parallel, 6 LLM slots
 Tournaments     : minibench + Spring AI Tournament only
-Bot comments    : never expose model names
+Bot comments    : clean prose — no internal labels or model names published
 """
 
 import argparse
@@ -69,11 +72,22 @@ if not AGENTROUTER_API_KEY:
     logger.error("AGENTROUTER_API_KEY (or ANTHROPIC_API_KEY) not set.")
 
 # ---------------------------------------------------------------
-# Research model — any online/web-search-capable model that
-# AgentRouter supports.  Change to e.g. "openai/gpt-4o-search-preview"
-# or "google/gemini-2.0-flash" if you prefer a different provider.
+# Dual online research models — both web-search-capable,
+# routed through AgentRouter. No separate API keys required.
+# Override via env vars without touching code.
 # ---------------------------------------------------------------
-RESEARCH_MODEL = os.getenv("MEWHISK_RESEARCH_MODEL", "perplexity/sonar-pro")
+RESEARCH_MODEL_1 = os.getenv("MEWHISK_RESEARCH_MODEL_1", "perplexity/sonar-pro")
+RESEARCH_MODEL_2 = os.getenv("MEWHISK_RESEARCH_MODEL_2", "openai/gpt-4o-search-preview")
+
+# ============================================================
+# Concurrency controls — module-level so they are shared across
+# all bot instances and all async tasks in the process.
+#
+# _Q_SEM  : max questions being processed end-to-end at once
+# _LLM_SEM: max simultaneous outbound LLM / research HTTP calls
+# ============================================================
+_Q_SEM   = asyncio.Semaphore(4)
+_LLM_SEM = asyncio.Semaphore(6)
 
 # ============================================================
 # Helpers: stats + parsing
@@ -81,16 +95,20 @@ RESEARCH_MODEL = os.getenv("MEWHISK_RESEARCH_MODEL", "perplexity/sonar-pro")
 def _is_num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
-def median(lst: List[Union[float, int]]) -> float:
+
+def safe_median(lst: List[Union[float, int]]) -> float:
+    """Returns 0.5 on empty input instead of raising."""
     vals = sorted(float(x) for x in lst if _is_num(x))
     if not vals:
-        raise ValueError("median() called on empty list")
+        return 0.5
     n   = len(vals)
     mid = n // 2
     return (vals[mid - 1] + vals[mid]) / 2.0 if n % 2 == 0 else vals[mid]
 
+
 def mean(xs: List[float]) -> float:
-    return sum(xs) / len(xs)
+    return sum(xs) / len(xs) if xs else 0.0
+
 
 def stdev(xs: List[float]) -> float:
     if len(xs) <= 1:
@@ -98,13 +116,18 @@ def stdev(xs: List[float]) -> float:
     m = mean(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
 
+
 def ci90(xs: List[float]) -> Tuple[float, float]:
+    if not xs:
+        return 0.0, 1.0
     m, s = mean(xs), stdev(xs)
-    se   = s / math.sqrt(len(xs)) if xs else 0.0
+    se   = s / math.sqrt(len(xs))
     return max(0.0, m - 1.645 * se), min(1.0, m + 1.645 * se)
+
 
 def entropy(probs: Dict[str, float]) -> float:
     return -sum(p * math.log(p) for p in probs.values() if p > 0)
+
 
 def safe_float(x: Any, default: Optional[float] = 0.0) -> Optional[float]:
     try:
@@ -115,17 +138,21 @@ def safe_float(x: Any, default: Optional[float] = 0.0) -> Optional[float]:
     except Exception:
         return default
 
+
 def normalize_percentile(p: Any) -> float:
     perc = safe_float(p, default=0.5) or 0.5
     if perc > 1.0:
         perc /= 100.0
     return float(max(0.0, min(1.0, perc)))
 
+
 def clamp01(p: float, lo: float = 0.01, hi: float = 0.99) -> float:
     return max(lo, min(hi, float(p)))
 
+
 _PERCENT_RE = re.compile(r"(?i)\bprob(?:ability)?\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%")
 _DEC_RE     = re.compile(r"(?i)\bdecimal\s*:\s*([0-9]*\.?[0-9]+)\b")
+
 
 def extract_binary_prob_from_text(text: str) -> Optional[float]:
     if not text:
@@ -144,8 +171,10 @@ def extract_binary_prob_from_text(text: str) -> Optional[float]:
         return clamp01(val / 100.0, 0.0, 1.0) if val is not None else None
     return None
 
+
 def build_indexed_options(options: List[str]) -> List[str]:
     return [f"{i+1}) {opt}" for i, opt in enumerate(options)]
+
 
 def extract_indexed_mc_probs(text: str, n_options: int) -> Dict[int, float]:
     out: Dict[int, float] = {}
@@ -160,6 +189,7 @@ def extract_indexed_mc_probs(text: str, n_options: int) -> Dict[int, float]:
                 if pct is not None:
                     out[idx] = pct / 100.0
     return out
+
 
 def extract_numeric_percentiles(text: str, targets: List[float]) -> Dict[float, float]:
     out: Dict[float, float] = {}
@@ -178,80 +208,164 @@ def extract_numeric_percentiles(text: str, targets: List[float]) -> Dict[float, 
                     break
     return out
 
-def build_query(question: MetaculusQuestion, max_chars: int = 397) -> str:
-    q  = re.sub(r"\s+", " ", re.sub(r"http\S+", "", question.question_text or "")).strip()
-    bg = re.sub(r"\s+", " ", re.sub(r"http\S+", "", question.background_info or "")).strip()
-    rc = re.sub(r"\s+", " ", re.sub(r"http\S+", "", question.resolution_criteria or "")).strip()
-    # Prefer question + resolution criteria for search signal
-    combined = f"{q} — {rc}" if rc else q
-    if len(combined) <= max_chars:
-        return combined
-    if len(q) <= max_chars:
-        space = max_chars - len(q) - 3
-        if space > 10 and bg:
-            return f"{q} — {textwrap.shorten(bg, width=space, placeholder='…')}"
-        return q
-    first = q.split(".")[0].strip()
-    if len(first) > max_chars:
-        return textwrap.shorten(first, width=max_chars, placeholder="…")
-    remaining = max_chars - len(first) - 3
-    if remaining > 10 and bg:
-        combo = f"{first} — {textwrap.shorten(bg, width=remaining, placeholder='…')}"
-        if len(combo) <= max_chars:
-            return combo
+
+def build_query(question: MetaculusQuestion, max_chars: int = 450) -> str:
+    """
+    Build a compact search query from question text + resolution criteria
+    (primary search signal) with background as fallback padding.
+    All URLs are stripped first.
+    """
+    def _clean(s: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"http\S+", "", s or "")).strip()
+
+    q  = _clean(question.question_text)
+    rc = _clean(question.resolution_criteria)
+    bg = _clean(question.background_info)
+
+    for candidate in (
+        f"{q} — {rc}",
+        f"{q} — {textwrap.shorten(rc, width=max(10, max_chars - len(q) - 3), placeholder='…')}",
+        f"{q} — {textwrap.shorten(bg, width=max(10, max_chars - len(q) - 3), placeholder='…')}",
+        q,
+    ):
+        if candidate and len(candidate) <= max_chars:
+            return candidate
     return textwrap.shorten(q, width=max_chars, placeholder="…")
 
+
 # ============================================================
-# EXTREMIZE — conservative / humble settings
-# Binary: k=1.15  (gentle logit push toward conviction)
-# MC:     k=1.12  (gentle power sharpening)
+# EXTREMIZE — conservative / humble
+# Binary : k=1.15  (gentle logit push toward conviction)
+# MC     : k=1.12  (gentle power sharpening)
 # Numeric: no extremization — preserve distributional calibration
 # ============================================================
 def _logit(p: float) -> float:
     p = clamp01(p, 1e-6, 1.0 - 1e-6)
     return math.log(p / (1.0 - p))
 
+
 def _sigmoid(x: float) -> float:
     z    = math.exp(-abs(x))
     base = 1.0 / (1.0 + z)
     return base if x >= 0 else 1.0 - base
+
 
 def extremize_binary(p: float, k: float) -> float:
     if not _is_num(p) or not _is_num(k) or k <= 0 or abs(k - 1.0) < 1e-12:
         return float(p)
     return clamp01(_sigmoid(_logit(float(p)) * float(k)))
 
+
 def extremize_mc(probs: Dict[str, float], k: float) -> Dict[str, float]:
     if not probs or not _is_num(k) or k <= 0 or abs(k - 1.0) < 1e-12:
         s = sum(max(0.0, float(v)) for v in probs.values())
-        return {a: max(0.0, float(v)) / s for a, v in probs.items()} if s > 0 else {a: 1.0 / len(probs) for a in probs}
+        return (
+            {a: max(0.0, float(v)) / s for a, v in probs.items()}
+            if s > 0 else {a: 1.0 / len(probs) for a in probs}
+        )
     powered = {a: max(0.0, float(v)) ** float(k) for a, v in probs.items()}
     s2      = sum(powered.values())
     return {a: v / s2 for a, v in powered.items()} if s2 > 0 else {a: 1.0 / len(probs) for a in probs}
 
+
 # ============================================================
-# Weighted blend helper (handles partial agent failure cleanly)
+# Weighted blend — handles partial agent failure cleanly
 # ============================================================
 def _weighted_blend(pairs: List[Tuple[float, Optional[float]]]) -> float:
-    """Blend (weight, value) pairs, ignoring None values, renormalising weights."""
-    valid     = [(w, v) for w, v in pairs if v is not None and _is_num(v)]
-    total_w   = sum(w for w, _ in valid)
+    """
+    Blend (weight, value) pairs, skipping None values and
+    renormalising remaining weights so partial failures degrade gracefully.
+    Returns 0.5 only when every value is None.
+    """
+    valid   = [(w, float(v)) for w, v in pairs if v is not None and _is_num(v)]
+    total_w = sum(w for w, _ in valid)
     if not valid or total_w == 0:
         return 0.5
-    return sum(w * float(v) / total_w for w, v in valid)
+    return sum(w * v / total_w for w, v in valid)
+
 
 # ============================================================
-# Research via AgentRouter online model
+# Isotonic regression for monotone percentile enforcement
+# Pool-adjacent-violators algorithm — avoids tail distortion
+# caused by the hard-clamp approach.
 # ============================================================
-def _sync_agentrouter_research(query: str) -> str:
+def _isotonic_regression_increasing(vals: List[float]) -> List[float]:
     """
-    Call an online/web-search-capable model through AgentRouter's
-    OpenAI-compatible /v1/chat/completions endpoint.
+    PAV algorithm: returns a non-decreasing sequence of the same length.
+    Each block carries equal weight (count = 1 per original element).
+    """
+    if not vals:
+        return []
+    # Represent each block as (average_value, list_of_original_indices)
+    blocks: List[Tuple[float, List[int]]] = [(v, [i]) for i, v in enumerate(vals)]
+    result = list(vals)
 
-    The model string is controlled by MEWHISK_RESEARCH_MODEL
-    (default: perplexity/sonar-pro).  AgentRouter transparently
-    routes this to the upstream provider with live web access —
-    no separate API key is required beyond AGENTROUTER_API_KEY.
+    i = 0
+    while i < len(blocks) - 1:
+        avg_i = blocks[i][0]
+        avg_j = blocks[i + 1][0]
+        if avg_i > avg_j:                        # monotonicity violation — merge
+            merged_indices = blocks[i][1] + blocks[i + 1][1]
+            merged_avg     = sum(result[j] for j in merged_indices) / len(merged_indices)
+            for j in merged_indices:
+                result[j] = merged_avg
+            blocks = blocks[:i] + [(merged_avg, merged_indices)] + blocks[i + 2:]
+            if i > 0:
+                i -= 1                           # recheck left neighbour
+        else:
+            i += 1
+    return result
+
+
+def enforce_monotone(pts: List[Percentile]) -> List[Percentile]:
+    """Apply isotonic regression to a sorted-by-percentile list of Percentile objects."""
+    pts    = sorted(pts, key=lambda x: float(x.percentile))
+    values = _isotonic_regression_increasing([float(p.value) for p in pts])
+    for p, v in zip(pts, values):
+        p.value = v
+    return pts
+
+
+# ============================================================
+# Percentile interpolation — linear between bracketing points
+# ============================================================
+def interpolate_percentile(source: Dict[float, float], target: float) -> Optional[float]:
+    """
+    Linearly interpolate within the source dict; clamp to edge values
+    outside the known range. Returns None only when source is empty.
+    """
+    if not source:
+        return None
+    keys = sorted(source.keys())
+    if target <= keys[0]:
+        return source[keys[0]]
+    if target >= keys[-1]:
+        return source[keys[-1]]
+    for i in range(len(keys) - 1):
+        lo, hi = keys[i], keys[i + 1]
+        if lo <= target <= hi:
+            frac = (target - lo) / (hi - lo) if hi != lo else 0.0
+            return source[lo] + frac * (source[hi] - source[lo])
+    return None
+
+
+# ============================================================
+# Dual online research via AgentRouter
+# ============================================================
+_RESEARCH_SYSTEM = (
+    "You are a precise real-time news researcher. Today is {today}. "
+    "Search the web and give a concise, factual digest relevant to the "
+    "forecasting question below. Include exact dates, numbers, and source names. "
+    "Max 400 words. Cite sources inline where possible."
+)
+_RESEARCH_USER = "Research for forecasting: {query}"
+
+
+def _sync_online_research(model: str, query: str, label: str) -> str:
+    """
+    Single online research call through AgentRouter's
+    OpenAI-compatible /v1/chat/completions endpoint.
+    Only AGENTROUTER_API_KEY is required — no provider-specific keys.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     try:
@@ -262,51 +376,55 @@ def _sync_agentrouter_research(query: str) -> str:
                 "Content-Type":  "application/json",
             },
             json={
-                "model": RESEARCH_MODEL,
+                "model":    model,
                 "messages": [
-                    {
-                        "role":    "system",
-                        "content": (
-                            f"You are a precise real-time news researcher. Today is {today}. "
-                            "Search the web and give a concise, factual digest relevant to the "
-                            "forecasting question. Include exact dates, numbers, and source names. "
-                            "Max 400 words. Cite sources inline where possible."
-                        ),
-                    },
-                    {
-                        "role":    "user",
-                        "content": f"Research for forecasting: {query}",
-                    },
+                    {"role": "system", "content": _RESEARCH_SYSTEM.format(today=today)},
+                    {"role": "user",   "content": _RESEARCH_USER.format(query=query)},
                 ],
-                "max_tokens":  600,
+                "max_tokens":  650,
                 "temperature": 0.1,
             },
-            timeout=40,
+            timeout=45,
         )
         resp.raise_for_status()
         data    = resp.json()
         content = data["choices"][0]["message"]["content"].strip()
-
-        # Attach any citations the model returns (e.g. Perplexity-style)
+        # Perplexity-style inline citations when present
         citations = data.get("citations", [])
         if citations:
             content += "\nSources: " + " | ".join(str(c) for c in citations[:5])
-
         return content
-
     except Exception as e:
-        logger.error(f"AgentRouter research error ({RESEARCH_MODEL}): {e}")
-        return f"[Research failed: {e}]"
+        logger.warning(f"Research model {label} ({model}) failed: {e}")
+        return f"[{label} research unavailable: {e}]"
 
 
 async def _run_research_pipeline(query: str, loop: asyncio.AbstractEventLoop) -> str:
-    """Single async wrapper around the AgentRouter online-model research call."""
+    """
+    Run both online research models in parallel under the shared LLM semaphore.
+    Both results are concatenated into one research block for the forecaster.
+    A failure in one source still leaves the other available.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
-    result = await loop.run_in_executor(None, _sync_agentrouter_research, query)
-    return (
-        f"[Research as of {today} — model: {RESEARCH_MODEL} via AgentRouter]\n\n"
-        f"{result}"
+    results: Dict[int, str] = {}
+
+    async def fetch(slot: int, model: str, label: str) -> None:
+        async with _LLM_SEM:
+            results[slot] = await loop.run_in_executor(
+                None, _sync_online_research, model, query, label
+            )
+
+    await asyncio.gather(
+        fetch(1, RESEARCH_MODEL_1, "R1"),
+        fetch(2, RESEARCH_MODEL_2, "R2"),
     )
+
+    return (
+        f"[Research as of {today}]\n\n"
+        f"=== ONLINE SOURCE 1 ({RESEARCH_MODEL_1}) ===\n{results.get(1, '[unavailable]')}\n\n"
+        f"=== ONLINE SOURCE 2 ({RESEARCH_MODEL_2}) ===\n{results.get(2, '[unavailable]')}"
+    )
+
 
 # ============================================================
 # Bot
@@ -315,19 +433,20 @@ class mewhisk(ForecastBot):
     """
     mewhisk — dual-model forecasting bot via AgentRouter.
 
-    All LLM calls (research + forecast) route through AgentRouter:
-      • Research  : online model (default perplexity/sonar-pro) — live web
-      • Primary   : claude-sonnet-4-6
-      • Adversarial checker: claude-opus-4-6
+    Research  : two online-capable models run in parallel
+                (default: perplexity/sonar-pro + openai/gpt-4o-search-preview)
+    Primary   : claude-sonnet-4-6
+    Adversarial: claude-opus-4-6   (run concurrently with primary)
 
+    All calls share a single AGENTROUTER_API_KEY.
     Extremization: ON, conservative — k_binary=1.15, k_mc=1.12.
     Numeric distributions: no extremization.
-    Bot comments: [AGENT_A] / [AGENT_B] — model names never shown.
+    Published comments: clean prose, no internal debug labels or model names.
     """
 
-    _max_concurrent_questions          = 3   # parallelise across questions
-    _concurrency_limiter               = asyncio.Semaphore(3)
-    _structure_output_validation_samples = 3  # safer structured parse
+    _max_concurrent_questions            = 4
+    _concurrency_limiter                 = _Q_SEM
+    _structure_output_validation_samples = 3
 
     def _llm_config_defaults(self) -> Dict[str, str]:
         defaults = super()._llm_config_defaults()
@@ -354,8 +473,10 @@ class mewhisk(ForecastBot):
         self._drop_counts_by_model: Dict[str, Dict[str, int]] = {"sonnet": {}, "opus": {}}
         logger.info(
             f"mewhisk ready | AgentRouter={_AGENTROUTER_BASE} | "
-            f"research_model={RESEARCH_MODEL} | "
-            f"extremize=ON k_bin={self.extremize_k_binary} k_mc={self.extremize_k_mc}"
+            f"research=[{RESEARCH_MODEL_1}, {RESEARCH_MODEL_2}] | "
+            f"forecast=[sonnet(primary), opus(adversarial)] | "
+            f"extremize=ON k_bin={self.extremize_k_binary} k_mc={self.extremize_k_mc} | "
+            f"concurrency=questions:{self._max_concurrent_questions} llm_slots:6"
         )
 
     def _inc_drop(self, tag: str, reason: str) -> None:
@@ -368,17 +489,17 @@ class mewhisk(ForecastBot):
     # Research
     # ----------------------------------------------------------
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            query  = build_query(question)
-            loop   = asyncio.get_running_loop()
-            result = await _run_research_pipeline(query, loop)
-            return result
+        async with _Q_SEM:
+            query = build_query(question)
+            loop  = asyncio.get_running_loop()
+            return await _run_research_pipeline(query, loop)
 
     # ----------------------------------------------------------
-    # LLM helpers
+    # LLM helpers (all gated by _LLM_SEM)
     # ----------------------------------------------------------
     async def _invoke_llm(self, model_name: str, prompt: str) -> str:
-        return await self.get_llm(model_name, "llm").invoke(prompt)
+        async with _LLM_SEM:
+            return await self.get_llm(model_name, "llm").invoke(prompt)
 
     async def _invoke_with_format_retry(self, model_name: str, prompt: str, _: str) -> str:
         return await self._invoke_llm(model_name, prompt)
@@ -437,7 +558,10 @@ class mewhisk(ForecastBot):
         if not idx_probs:
             self._inc_drop(tag, "parse_error_mc_fallback")
             return None
-        out2 = {options[i - 1]: float(idx_probs[i]) for i in range(1, len(options) + 1) if i in idx_probs}
+        out2 = {
+            options[i - 1]: float(idx_probs[i])
+            for i in range(1, len(options) + 1) if i in idx_probs
+        }
         if not out2:
             self._inc_drop(tag, "parse_error_mc_fallback_empty")
         return out2 or None
@@ -453,67 +577,31 @@ class mewhisk(ForecastBot):
                 model=self.get_llm("parser", "llm"),
                 num_validation_samples=self._structure_output_validation_samples,
             )
-            pts = []
-            for p in percentile_list:
-                v = safe_float(getattr(p, "value", None), default=None)
-                if v is not None:
-                    pts.append(
-                        Percentile(
-                            value=float(v),
-                            percentile=normalize_percentile(getattr(p, "percentile", 0.5)),
-                        )
-                    )
+            pts = [
+                Percentile(
+                    value=float(v),
+                    percentile=normalize_percentile(getattr(p, "percentile", 0.5)),
+                )
+                for p in percentile_list
+                if (v := safe_float(getattr(p, "value", None), default=None)) is not None
+            ]
             if pts:
-                pts = self._enforce_monotone(pts)
-                return NumericDistribution.from_question(pts, question)
+                return NumericDistribution.from_question(enforce_monotone(pts), question)
         except Exception:
             self._inc_drop(tag, "parse_error_numeric_structured")
         extracted = extract_numeric_percentiles(raw, targets)
         if not extracted:
             self._inc_drop(tag, "parse_error_numeric_fallback")
             return None
-        pts2 = sorted(
-            [Percentile(percentile=pt, value=float(extracted[pt])) for pt in targets if pt in extracted],
-            key=lambda x: float(x.percentile),
-        )
-        pts2 = self._enforce_monotone(pts2)
-        return NumericDistribution.from_question(pts2, question)
+        pts2 = [
+            Percentile(percentile=pt, value=float(extracted[pt]))
+            for pt in targets if pt in extracted
+        ]
+        return NumericDistribution.from_question(enforce_monotone(pts2), question)
 
-    @staticmethod
-    def _enforce_monotone(pts: List[Percentile]) -> List[Percentile]:
-        """
-        Fix monotonicity violations by averaging the two swapped neighbours
-        rather than hard-clamping, which can distort tails.
-        """
-        pts = sorted(pts, key=lambda x: float(x.percentile))
-        changed = True
-        while changed:
-            changed = False
-            for i in range(1, len(pts)):
-                if pts[i].value < pts[i - 1].value:
-                    avg = (pts[i - 1].value + pts[i].value) / 2.0
-                    pts[i - 1].value = avg
-                    pts[i].value     = avg
-                    changed          = True
-        return pts
-
-    @staticmethod
-    def _interpolate_percentile(source: Dict[float, float], target: float) -> Optional[float]:
-        """Linear interpolation between the two nearest bracketing percentile points."""
-        if not source:
-            return None
-        keys = sorted(source.keys())
-        if target <= keys[0]:
-            return source[keys[0]]
-        if target >= keys[-1]:
-            return source[keys[-1]]
-        for i in range(len(keys) - 1):
-            lo, hi = keys[i], keys[i + 1]
-            if lo <= target <= hi:
-                frac = (target - lo) / (hi - lo) if hi != lo else 0.0
-                return source[lo] + frac * (source[hi] - source[lo])
-        return None
-
+    # ----------------------------------------------------------
+    # Bounds helpers
+    # ----------------------------------------------------------
     def _bounds_messages(self, q: NumericQuestion) -> Tuple[str, str]:
         low  = q.nominal_lower_bound if q.nominal_lower_bound is not None else q.lower_bound
         high = q.nominal_upper_bound if q.nominal_upper_bound is not None else q.upper_bound
@@ -522,8 +610,14 @@ class mewhisk(ForecastBot):
             f"Cannot be higher than {high}." if not q.open_upper_bound else f"Unlikely above {high}.",
         )
 
+    def _numeric_midpoint(self, q: NumericQuestion) -> float:
+        try:
+            return (float(q.lower_bound or 0) + float(q.upper_bound or 100)) / 2.0
+        except Exception:
+            return 50.0
+
     # ----------------------------------------------------------
-    # Prompts — no model names ever appear in output
+    # Prompts — no model names, no internal labels in output
     # ----------------------------------------------------------
     def _binary_prompt(self, q: BinaryQuestion, research: str, role: str) -> str:
         return clean_indents(f"""
@@ -599,7 +693,7 @@ class mewhisk(ForecastBot):
         """)
 
     # ----------------------------------------------------------
-    # Per-role runners
+    # Per-role runners (with retry on parse failure)
     # ----------------------------------------------------------
     async def _run_binary_role(
         self, q: BinaryQuestion, research: str, tag: str, role: str
@@ -662,16 +756,12 @@ class mewhisk(ForecastBot):
                 self._inc_drop(tag, "retry_failed_numeric")
         if dist is None:
             self._inc_drop(tag, "invalid_numeric")
-            try:
-                l, u = float(q.lower_bound or 0), float(q.upper_bound or 100)
-            except Exception:
-                l, u = 0.0, 100.0
             dist = NumericDistribution.from_question(
-                [Percentile(value=(l + u) / 2, percentile=0.5)], q
+                [Percentile(value=self._numeric_midpoint(q), percentile=0.5)], q
             )
         return ReasonedPrediction(prediction_value=dist, reasoning=raw)
 
-    # Required overrides (single-agent shortcuts — unused in dual-agent flow)
+    # Required single-agent overrides (used when _make_prediction is bypassed)
     async def _run_forecast_on_binary(self, q, research):
         return await self._run_binary_role(q, research, "sonnet", "PRIMARY")
 
@@ -682,16 +772,38 @@ class mewhisk(ForecastBot):
         return await self._run_numeric_role(q, research, "sonnet", "PRIMARY")
 
     # ----------------------------------------------------------
-    # Dual-agent prediction
+    # Clean reasoning for public Metaculus comments.
+    # Strips internal stat lines, agent labels, and separator lines.
+    # ----------------------------------------------------------
+    @staticmethod
+    def _clean_for_publish(reasoning: str) -> str:
+        output_lines: List[str] = []
+        for line in reasoning.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[stats]"):
+                continue
+            if re.match(r"^\[AGENT_[A-Z]\]", stripped):
+                continue
+            if stripped == "---":
+                continue
+            output_lines.append(line)
+        # Collapse runs of blank lines to a single blank
+        cleaned  = "\n".join(output_lines)
+        cleaned  = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    # ----------------------------------------------------------
+    # Dual-agent prediction core
+    # Sonnet + Opus run concurrently; results are blended with
+    # weight-renormalisation so one failure degrades gracefully.
     # ----------------------------------------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
-        async with self._concurrency_limiter:
-            preds:     List[Any] = []
-            reasonings: List[str] = []
+        async with _Q_SEM:
+            preds:      List[Tuple[str, Any]] = []
+            reasonings: List[str]             = []
             w_s, w_o = 0.55, 0.45
 
-            # Run Sonnet (primary) and Opus (adversarial) in parallel
-            async def run_agent(tag: str, role: str):
+            async def run_agent(tag: str, role: str) -> None:
                 try:
                     if isinstance(question, BinaryQuestion):
                         p = await self._run_binary_role(question, research, tag, role)
@@ -705,43 +817,46 @@ class mewhisk(ForecastBot):
                 except Exception as e:
                     logger.error(f"Agent {tag} failed: {e}")
 
+            # Sonnet + Opus in parallel
             await asyncio.gather(
                 run_agent("sonnet", "PRIMARY"),
                 run_agent("opus",   "ADVERSARIAL_CHECKER"),
             )
 
             if not preds:
-                raise RuntimeError("All agents failed.")
+                raise RuntimeError("All forecast agents failed.")
 
-            combined = "\n\n---\n\n".join(reasonings)
+            internal_reasoning = "\n\n---\n\n".join(reasonings)
 
-            def get_pred(tag: str) -> Any:
+            def get_val(tag: str) -> Any:
                 for t, v in preds:
                     if t == tag:
                         return v
                 return None
 
-            s_pred = get_pred("sonnet")
-            o_pred = get_pred("opus")
+            s_pred = get_val("sonnet")
+            o_pred = get_val("opus")
 
             # ---- BINARY ----
             if isinstance(question, BinaryQuestion):
                 s_val = float(s_pred) if s_pred is not None and _is_num(s_pred) else None
                 o_val = float(o_pred) if o_pred is not None and _is_num(o_pred) else None
-                final = _weighted_blend([(w_s, s_val), (w_o, o_val)])
-                final = clamp01(final)
+                final = clamp01(_weighted_blend([(w_s, s_val), (w_o, o_val)]))
                 pre   = final
                 if self.extremize_enabled:
                     final = extremize_binary(final, self.extremize_k_binary)
-                np_   = [v for v in [s_val, o_val] if v is not None] or [0.5]
-                m, md, sd = mean(np_), median(np_), stdev(np_)
+                np_       = [v for v in [s_val, o_val] if v is not None] or [0.5]
+                m, md, sd = mean(np_), safe_median(np_), stdev(np_)
                 lo, hi    = ci90(np_)
                 stats = (
                     f"[stats] n={len(np_)} mean={m:.3f} median={md:.3f} sd={sd:.3f} "
-                    f"ci90=({lo:.3f},{hi:.3f}) extremize(k={self.extremize_k_binary:.2f}) "
-                    f"{pre:.3f}→{final:.3f}"
+                    f"ci90=({lo:.3f},{hi:.3f}) "
+                    f"extremize(k={self.extremize_k_binary:.2f}) {pre:.3f}→{final:.3f}"
                 )
-                return ReasonedPrediction(prediction_value=final, reasoning=stats + "\n\n" + combined)
+                return ReasonedPrediction(
+                    prediction_value=final,
+                    reasoning=self._clean_for_publish(stats + "\n\n" + internal_reasoning),
+                )
 
             # ---- MC ----
             if isinstance(question, MultipleChoiceQuestion):
@@ -758,10 +873,13 @@ class mewhisk(ForecastBot):
                 o_d = p2d(o_pred) if o_pred is not None else {}
                 blended: Dict[str, float] = {}
                 for opt in options:
-                    sv, ov   = s_d.get(opt), o_d.get(opt)
+                    sv, ov       = s_d.get(opt), o_d.get(opt)
                     blended[opt] = _weighted_blend([(w_s, sv), (w_o, ov)]) or 1e-6
                 total   = sum(blended.values())
-                blended = {k: v / total for k, v in blended.items()} if total > 0 else {o: 1.0 / len(options) for o in options}
+                blended = (
+                    {k: v / total for k, v in blended.items()}
+                    if total > 0 else {o: 1.0 / len(options) for o in options}
+                )
                 if self.extremize_enabled:
                     blended = extremize_mc(blended, self.extremize_k_mc)
                 stats = (
@@ -770,12 +888,15 @@ class mewhisk(ForecastBot):
                 )
                 return ReasonedPrediction(
                     prediction_value=PredictedOptionList(
-                        predicted_options=[PredictedOption(option_name=o, probability=float(p)) for o, p in blended.items()]
+                        predicted_options=[
+                            PredictedOption(option_name=o, probability=float(p))
+                            for o, p in blended.items()
+                        ]
                     ),
-                    reasoning=stats + "\n\n" + combined,
+                    reasoning=self._clean_for_publish(stats + "\n\n" + internal_reasoning),
                 )
 
-            # ---- NUMERIC (no extremization) ----
+            # ---- NUMERIC (no extremization — preserve distributional calibration) ----
             if isinstance(question, NumericQuestion):
                 targets = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
 
@@ -792,28 +913,28 @@ class mewhisk(ForecastBot):
                 o_m = d2m(o_pred) if o_pred is not None else {}
                 pts: List[Percentile] = []
                 for pt in targets:
-                    sv = self._interpolate_percentile(s_m, pt) if s_m else None
-                    ov = self._interpolate_percentile(o_m, pt) if o_m else None
+                    sv = interpolate_percentile(s_m, pt) if s_m else None
+                    ov = interpolate_percentile(o_m, pt) if o_m else None
                     v  = _weighted_blend([(w_s, sv), (w_o, ov)])
-                    if v is None or v == 0.5 and sv is None and ov is None:
-                        try:
-                            l, u = float(question.lower_bound or 0), float(question.upper_bound or 100)
-                        except Exception:
-                            l, u = 0.0, 100.0
-                        v = (l + u) / 2.0
+                    # _weighted_blend returns 0.5 when both are None — replace with domain midpoint
+                    if sv is None and ov is None:
+                        v = self._numeric_midpoint(question)
                     pts.append(Percentile(percentile=pt, value=float(v)))
-                pts = self._enforce_monotone(pts)
+                pts = enforce_monotone(pts)
                 p10    = next((p.value for p in pts if abs(float(p.percentile) - 0.1) < 1e-9), None)
                 p90    = next((p.value for p in pts if abs(float(p.percentile) - 0.9) < 1e-9), None)
                 spread = (p90 - p10) if (p10 is not None and p90 is not None) else float("nan")
                 stats  = f"[stats] n_agents={len(preds)} p10={p10} p90={p90} spread={spread:.3f}"
                 return ReasonedPrediction(
                     prediction_value=NumericDistribution.from_question(pts, question),
-                    reasoning=stats + "\n\n" + combined,
+                    reasoning=self._clean_for_publish(stats + "\n\n" + internal_reasoning),
                 )
 
-            # Fallback — return first available prediction as-is
-            return ReasonedPrediction(prediction_value=preds[0][1], reasoning=combined)
+            # Fallback
+            return ReasonedPrediction(
+                prediction_value=preds[0][1],
+                reasoning=self._clean_for_publish(internal_reasoning),
+            )
 
     # ----------------------------------------------------------
     # Diagnostics
@@ -827,8 +948,8 @@ class mewhisk(ForecastBot):
 # ============================================================
 # MAIN
 # ============================================================
-MINIBENCH_ID           = "minibench"
-SPRING_AI_TOURNAMENT_ID = "32916"   # update to real tournament ID if it changes
+MINIBENCH_ID            = "minibench"
+SPRING_AI_TOURNAMENT_ID = "32916"    # update to real ID if it changes
 
 if __name__ == "__main__":
     logging.getLogger("litellm").setLevel(logging.WARNING)
@@ -836,8 +957,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "mewhisk: AgentRouter | online-model research (perplexity/sonar-pro) | "
-            "conservative extremize"
+            "mewhisk: AgentRouter | dual online-model research | conservative extremize\n"
+            "Research models: perplexity/sonar-pro + openai/gpt-4o-search-preview (parallel)\n"
+            "Forecast models: claude-sonnet-4-6 (primary) + claude-opus-4-6 (adversarial)"
         )
     )
     parser.add_argument(
@@ -845,23 +967,33 @@ if __name__ == "__main__":
         default=[MINIBENCH_ID, SPRING_AI_TOURNAMENT_ID],
         help="Tournament IDs to forecast (default: minibench + Spring AI Tournament)",
     )
-    parser.add_argument("--no-extremize",         action="store_true", help="Disable extremization")
-    parser.add_argument("--extremize-k-binary",   type=float, default=1.15)
-    parser.add_argument("--extremize-k-mc",       type=float, default=1.12)
+    parser.add_argument("--no-extremize",       action="store_true", help="Disable extremization")
+    parser.add_argument("--extremize-k-binary", type=float, default=1.15)
+    parser.add_argument("--extremize-k-mc",     type=float, default=1.12)
     parser.add_argument(
-        "--research-model", type=str, default=None,
+        "--research-model-1", type=str, default=None,
         help=(
-            "Override MEWHISK_RESEARCH_MODEL env var. "
-            "Any online-capable model on AgentRouter, e.g. "
-            "'perplexity/sonar-pro', 'openai/gpt-4o-search-preview', "
-            "'google/gemini-2.0-flash'."
+            "Primary online research model (env: MEWHISK_RESEARCH_MODEL_1). "
+            "Must be web-search-capable and available on AgentRouter. "
+            "Default: perplexity/sonar-pro"
+        ),
+    )
+    parser.add_argument(
+        "--research-model-2", type=str, default=None,
+        help=(
+            "Secondary online research model (env: MEWHISK_RESEARCH_MODEL_2). "
+            "Must be web-search-capable and available on AgentRouter. "
+            "Default: openai/gpt-4o-search-preview"
         ),
     )
     args = parser.parse_args()
 
-    if args.research_model:
-        os.environ["MEWHISK_RESEARCH_MODEL"] = args.research_model
-        RESEARCH_MODEL = args.research_model  # noqa: F811
+    if args.research_model_1:
+        os.environ["MEWHISK_RESEARCH_MODEL_1"] = args.research_model_1
+        RESEARCH_MODEL_1 = args.research_model_1  # noqa: F811
+    if args.research_model_2:
+        os.environ["MEWHISK_RESEARCH_MODEL_2"] = args.research_model_2
+        RESEARCH_MODEL_2 = args.research_model_2  # noqa: F811
 
     if not AGENTROUTER_API_KEY:
         logger.error("AGENTROUTER_API_KEY is required.")
@@ -877,10 +1009,10 @@ if __name__ == "__main__":
         extremize_k_mc=args.extremize_k_mc,
     )
 
-    async def run_all():
-        all_reports = []
+    async def run_all() -> List[Any]:
+        all_reports: List[Any] = []
         for tid in args.tournament_ids:
-            logger.info(f"mewhisk forecasting on: {tid}")
+            logger.info(f"mewhisk forecasting on tournament: {tid}")
             reports = await bot.forecast_on_tournament(tid, return_exceptions=True)
             all_reports.extend(reports)
         return all_reports
