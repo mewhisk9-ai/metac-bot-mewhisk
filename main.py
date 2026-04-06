@@ -1,17 +1,28 @@
 """
 mewhisk — Metaculus forecasting bot
 =====================================
-Agent routing   : AgentRouter (https://agentrouter.org)
-Primary model   : claude-sonnet-4-6       (fast, calibrated)
-Checker model   : claude-opus-4-6         (deep adversarial)
+Agent routing   : AgentRouter (https://agentrouter.org) — research only
+Primary model   : openrouter/qwen/qwen3.6-plus:free      (fast, calibrated)
+Checker model   : openrouter/nvidia/nemotron-super-49b-v1:free  (adversarial)
+Parser model    : openrouter/qwen/qwen3.6-plus:free
 Research        : perplexity/sonar-pro    (online, live web)  ← primary
                 + openai/gpt-4o-search-preview (online, live web) ← secondary
-                  Both run in parallel, concatenated into one research block.
+                  Both run in parallel via AgentRouter, concatenated into one block.
                   Override via MEWHISK_RESEARCH_MODEL_1 / _MODEL_2 env vars.
 Extremization   : ON — conservative (k_binary=1.15, k_mc=1.12)
 Concurrency     : 4 questions in parallel, 6 LLM slots
 Tournaments     : minibench + Spring AI Tournament only
 Bot comments    : clean prose — no internal labels or model names published
+
+FIXES vs previous version:
+  - Forecasters now call OpenRouter directly (separate OPENROUTER_API_KEY +
+    base URL https://openrouter.ai/api/v1) to avoid the Aliyun WAF captcha
+    wall that blocks AgentRouter's Anthropic endpoint from some regions.
+  - Parser also uses OpenRouter so litellm never needs to resolve a bare
+    "claude-*" model string against the overridden ANTHROPIC_API_BASE.
+  - Research pipeline still uses AgentRouter (perplexity/sonar-pro +
+    openai/gpt-4o-search-preview) via direct HTTP — unaffected by the WAF.
+  - OPENAI_API_KEY stub set to suppress noisy openai.agents SDK warning.
 """
 
 import argparse
@@ -25,17 +36,31 @@ from datetime import datetime
 from typing import List, Union, Dict, Any, Optional, Tuple
 
 # ---------------------------------------------------------------
-# AgentRouter env setup
-# forecasting-tools uses litellm; pointing ANTHROPIC_API_BASE
-# at AgentRouter makes every anthropic/* call route through it.
-# All model calls (research + forecast) go through AgentRouter.
+# Suppress the "OPENAI_API_KEY is not set, skipping trace export"
+# warning from the openai.agents tracing SDK.
+# ---------------------------------------------------------------
+os.environ.setdefault("OPENAI_API_KEY", "sk-dummy-suppress-warning")
+
+# ---------------------------------------------------------------
+# AgentRouter — used ONLY for research (perplexity/sonar-pro etc.)
+# We do NOT set ANTHROPIC_API_BASE here anymore; that was causing
+# litellm to route bare "claude-*" parser calls to AgentRouter,
+# which gets geo-blocked by Aliyun WAF in some regions.
 # ---------------------------------------------------------------
 _AGENTROUTER_KEY  = os.getenv("AGENTROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
 _AGENTROUTER_BASE = "https://agentrouter.org/v1"
 
-if _AGENTROUTER_KEY:
-    os.environ.setdefault("ANTHROPIC_API_KEY",  _AGENTROUTER_KEY)
-    os.environ.setdefault("ANTHROPIC_API_BASE", _AGENTROUTER_BASE)
+# ---------------------------------------------------------------
+# OpenRouter — used for ALL LLM forecast/parser calls.
+# Requires OPENROUTER_API_KEY in environment.
+# litellm routes "openrouter/*" models via this base URL
+# when OPENROUTER_API_KEY is set.
+# ---------------------------------------------------------------
+_OPENROUTER_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+
+if _OPENROUTER_KEY:
+    os.environ["OPENROUTER_API_KEY"] = _OPENROUTER_KEY
 
 import requests as _requests
 
@@ -65,26 +90,31 @@ logging.basicConfig(
 logger = logging.getLogger("mewhisk")
 
 # ============================================================
-# Env / API key check
+# Key checks
 # ============================================================
-AGENTROUTER_API_KEY = _AGENTROUTER_KEY
-if not AGENTROUTER_API_KEY:
-    logger.error("AGENTROUTER_API_KEY (or ANTHROPIC_API_KEY) not set.")
+if not _AGENTROUTER_KEY:
+    logger.warning("AGENTROUTER_API_KEY (or ANTHROPIC_API_KEY) not set — research may fail.")
+if not _OPENROUTER_KEY:
+    logger.error("OPENROUTER_API_KEY not set — forecast calls will fail.")
 
 # ---------------------------------------------------------------
-# Dual online research models — both web-search-capable,
-# routed through AgentRouter. No separate API keys required.
+# Forecaster / parser model strings — OpenRouter free tier.
+# litellm recognises the "openrouter/" prefix and routes correctly
+# when OPENROUTER_API_KEY is present.
+# ---------------------------------------------------------------
+FORECAST_MODEL_PRIMARY    = "openrouter/qwen/qwen3.6-plus:free"
+FORECAST_MODEL_ADVERSARIAL = "openrouter/nvidia/nemotron-super-49b-v1:free"
+PARSER_MODEL              = "openrouter/qwen/qwen3.6-plus:free"
+
+# ---------------------------------------------------------------
+# Dual online research models — routed through AgentRouter.
 # Override via env vars without touching code.
 # ---------------------------------------------------------------
 RESEARCH_MODEL_1 = os.getenv("MEWHISK_RESEARCH_MODEL_1", "perplexity/sonar-pro")
 RESEARCH_MODEL_2 = os.getenv("MEWHISK_RESEARCH_MODEL_2", "openai/gpt-4o-search-preview")
 
 # ============================================================
-# Concurrency controls — module-level so they are shared across
-# all bot instances and all async tasks in the process.
-#
-# _Q_SEM  : max questions being processed end-to-end at once
-# _LLM_SEM: max simultaneous outbound LLM / research HTTP calls
+# Concurrency controls
 # ============================================================
 _Q_SEM   = asyncio.Semaphore(4)
 _LLM_SEM = asyncio.Semaphore(6)
@@ -97,7 +127,6 @@ def _is_num(x: Any) -> bool:
 
 
 def safe_median(lst: List[Union[float, int]]) -> float:
-    """Returns 0.5 on empty input instead of raising."""
     vals = sorted(float(x) for x in lst if _is_num(x))
     if not vals:
         return 0.5
@@ -210,11 +239,6 @@ def extract_numeric_percentiles(text: str, targets: List[float]) -> Dict[float, 
 
 
 def build_query(question: MetaculusQuestion, max_chars: int = 450) -> str:
-    """
-    Build a compact search query from question text + resolution criteria
-    (primary search signal) with background as fallback padding.
-    All URLs are stripped first.
-    """
     def _clean(s: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"http\S+", "", s or "")).strip()
 
@@ -235,9 +259,6 @@ def build_query(question: MetaculusQuestion, max_chars: int = 450) -> str:
 
 # ============================================================
 # EXTREMIZE — conservative / humble
-# Binary : k=1.15  (gentle logit push toward conviction)
-# MC     : k=1.12  (gentle power sharpening)
-# Numeric: no extremization — preserve distributional calibration
 # ============================================================
 def _logit(p: float) -> float:
     p = clamp01(p, 1e-6, 1.0 - 1e-6)
@@ -269,14 +290,9 @@ def extremize_mc(probs: Dict[str, float], k: float) -> Dict[str, float]:
 
 
 # ============================================================
-# Weighted blend — handles partial agent failure cleanly
+# Weighted blend
 # ============================================================
 def _weighted_blend(pairs: List[Tuple[float, Optional[float]]]) -> float:
-    """
-    Blend (weight, value) pairs, skipping None values and
-    renormalising remaining weights so partial failures degrade gracefully.
-    Returns 0.5 only when every value is None.
-    """
     valid   = [(w, float(v)) for w, v in pairs if v is not None and _is_num(v)]
     total_w = sum(w for w, _ in valid)
     if not valid or total_w == 0:
@@ -285,18 +301,11 @@ def _weighted_blend(pairs: List[Tuple[float, Optional[float]]]) -> float:
 
 
 # ============================================================
-# Isotonic regression for monotone percentile enforcement
-# Pool-adjacent-violators algorithm — avoids tail distortion
-# caused by the hard-clamp approach.
+# Isotonic regression (PAV) for monotone percentile enforcement
 # ============================================================
 def _isotonic_regression_increasing(vals: List[float]) -> List[float]:
-    """
-    PAV algorithm: returns a non-decreasing sequence of the same length.
-    Each block carries equal weight (count = 1 per original element).
-    """
     if not vals:
         return []
-    # Represent each block as (average_value, list_of_original_indices)
     blocks: List[Tuple[float, List[int]]] = [(v, [i]) for i, v in enumerate(vals)]
     result = list(vals)
 
@@ -304,21 +313,20 @@ def _isotonic_regression_increasing(vals: List[float]) -> List[float]:
     while i < len(blocks) - 1:
         avg_i = blocks[i][0]
         avg_j = blocks[i + 1][0]
-        if avg_i > avg_j:                        # monotonicity violation — merge
+        if avg_i > avg_j:
             merged_indices = blocks[i][1] + blocks[i + 1][1]
             merged_avg     = sum(result[j] for j in merged_indices) / len(merged_indices)
             for j in merged_indices:
                 result[j] = merged_avg
             blocks = blocks[:i] + [(merged_avg, merged_indices)] + blocks[i + 2:]
             if i > 0:
-                i -= 1                           # recheck left neighbour
+                i -= 1
         else:
             i += 1
     return result
 
 
 def enforce_monotone(pts: List[Percentile]) -> List[Percentile]:
-    """Apply isotonic regression to a sorted-by-percentile list of Percentile objects."""
     pts    = sorted(pts, key=lambda x: float(x.percentile))
     values = _isotonic_regression_increasing([float(p.value) for p in pts])
     for p, v in zip(pts, values):
@@ -327,13 +335,9 @@ def enforce_monotone(pts: List[Percentile]) -> List[Percentile]:
 
 
 # ============================================================
-# Percentile interpolation — linear between bracketing points
+# Percentile interpolation
 # ============================================================
 def interpolate_percentile(source: Dict[float, float], target: float) -> Optional[float]:
-    """
-    Linearly interpolate within the source dict; clamp to edge values
-    outside the known range. Returns None only when source is empty.
-    """
     if not source:
         return None
     keys = sorted(source.keys())
@@ -350,7 +354,7 @@ def interpolate_percentile(source: Dict[float, float], target: float) -> Optiona
 
 
 # ============================================================
-# Dual online research via AgentRouter
+# Dual online research via AgentRouter (direct HTTP — no litellm)
 # ============================================================
 _RESEARCH_SYSTEM = (
     "You are a precise real-time news researcher. Today is {today}. "
@@ -362,17 +366,13 @@ _RESEARCH_USER = "Research for forecasting: {query}"
 
 
 def _sync_online_research(model: str, query: str, label: str) -> str:
-    """
-    Single online research call through AgentRouter's
-    OpenAI-compatible /v1/chat/completions endpoint.
-    Only AGENTROUTER_API_KEY is required — no provider-specific keys.
-    """
+    """Direct HTTP call to AgentRouter's chat/completions endpoint."""
     today = datetime.now().strftime("%Y-%m-%d")
     try:
         resp = _requests.post(
             f"{_AGENTROUTER_BASE}/chat/completions",
             headers={
-                "Authorization": f"Bearer {AGENTROUTER_API_KEY}",
+                "Authorization": f"Bearer {_AGENTROUTER_KEY}",
                 "Content-Type":  "application/json",
             },
             json={
@@ -389,7 +389,6 @@ def _sync_online_research(model: str, query: str, label: str) -> str:
         resp.raise_for_status()
         data    = resp.json()
         content = data["choices"][0]["message"]["content"].strip()
-        # Perplexity-style inline citations when present
         citations = data.get("citations", [])
         if citations:
             content += "\nSources: " + " | ".join(str(c) for c in citations[:5])
@@ -400,11 +399,6 @@ def _sync_online_research(model: str, query: str, label: str) -> str:
 
 
 async def _run_research_pipeline(query: str, loop: asyncio.AbstractEventLoop) -> str:
-    """
-    Run both online research models in parallel under the shared LLM semaphore.
-    Both results are concatenated into one research block for the forecaster.
-    A failure in one source still leaves the other available.
-    """
     today = datetime.now().strftime("%Y-%m-%d")
     results: Dict[int, str] = {}
 
@@ -427,21 +421,56 @@ async def _run_research_pipeline(query: str, loop: asyncio.AbstractEventLoop) ->
 
 
 # ============================================================
+# Direct OpenRouter HTTP call — bypasses litellm entirely for
+# forecaster/parser calls, avoiding any ANTHROPIC_API_BASE clash.
+# ============================================================
+def _sync_openrouter_call(model: str, prompt: str, max_tokens: int = 1200) -> str:
+    """
+    Call OpenRouter's chat completions endpoint directly.
+    'model' should be the full OpenRouter model id WITHOUT the
+    'openrouter/' litellm prefix, e.g. 'qwen/qwen3.6-plus:free'.
+    """
+    # Strip the litellm routing prefix if present
+    or_model = model.removeprefix("openrouter/")
+    try:
+        resp = _requests.post(
+            f"{_OPENROUTER_BASE}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_OPENROUTER_KEY}",
+                "Content-Type":  "application/json",
+                "HTTP-Referer":  "https://github.com/mewhisk",
+                "X-Title":       "mewhisk-forecasting-bot",
+            },
+            json={
+                "model":    or_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens":  max_tokens,
+                "temperature": 0.3,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        raise RuntimeError(f"OpenRouter call failed for {or_model}: {e}") from e
+
+
+# ============================================================
 # Bot
 # ============================================================
 class mewhisk(ForecastBot):
     """
-    mewhisk — dual-model forecasting bot via AgentRouter.
+    mewhisk — dual-model forecasting bot.
 
-    Research  : two online-capable models run in parallel
-                (default: perplexity/sonar-pro + openai/gpt-4o-search-preview)
-    Primary   : claude-sonnet-4-6
-    Adversarial: claude-opus-4-6   (run concurrently with primary)
+    Research    : AgentRouter → perplexity/sonar-pro + gpt-4o-search-preview (parallel)
+    Primary     : OpenRouter  → qwen/qwen3.6-plus:free        (weight 0.55)
+    Adversarial : OpenRouter  → nvidia/nemotron-super-49b-v1:free (weight 0.45)
+    Parser      : OpenRouter  → qwen/qwen3.6-plus:free
 
-    All calls share a single AGENTROUTER_API_KEY.
     Extremization: ON, conservative — k_binary=1.15, k_mc=1.12.
     Numeric distributions: no extremization.
-    Published comments: clean prose, no internal debug labels or model names.
+    Published comments: clean prose, no internal labels.
     """
 
     _max_concurrent_questions            = 4
@@ -449,11 +478,14 @@ class mewhisk(ForecastBot):
     _structure_output_validation_samples = 3
 
     def _llm_config_defaults(self) -> Dict[str, str]:
+        # These are used by the parent class for its own internal calls.
+        # We override _invoke_llm to bypass litellm for forecast/parser calls,
+        # so these entries mainly satisfy the parent's init expectations.
         defaults = super()._llm_config_defaults()
         defaults.update({
-            "forecaster_sonnet": "anthropic/claude-sonnet-4-6",
-            "forecaster_opus":   "anthropic/claude-opus-4-6",
-            "parser":            "anthropic/claude-sonnet-4-6",
+            "forecaster_primary":    FORECAST_MODEL_PRIMARY,
+            "forecaster_adversarial": FORECAST_MODEL_ADVERSARIAL,
+            "parser":                PARSER_MODEL,
         })
         return defaults
 
@@ -470,11 +502,12 @@ class mewhisk(ForecastBot):
         self.extremize_k_binary = float(extremize_k_binary)
         self.extremize_k_mc     = float(extremize_k_mc)
         self._drop_counts:          Dict[str, int]            = {}
-        self._drop_counts_by_model: Dict[str, Dict[str, int]] = {"sonnet": {}, "opus": {}}
+        self._drop_counts_by_model: Dict[str, Dict[str, int]] = {"primary": {}, "adversarial": {}}
         logger.info(
-            f"mewhisk ready | AgentRouter={_AGENTROUTER_BASE} | "
-            f"research=[{RESEARCH_MODEL_1}, {RESEARCH_MODEL_2}] | "
-            f"forecast=[sonnet(primary), opus(adversarial)] | "
+            f"mewhisk ready | "
+            f"research=AgentRouter:[{RESEARCH_MODEL_1}, {RESEARCH_MODEL_2}] | "
+            f"forecast=OpenRouter:[primary={FORECAST_MODEL_PRIMARY}, "
+            f"adversarial={FORECAST_MODEL_ADVERSARIAL}] | "
             f"extremize=ON k_bin={self.extremize_k_binary} k_mc={self.extremize_k_mc} | "
             f"concurrency=questions:{self._max_concurrent_questions} llm_slots:6"
         )
@@ -495,109 +528,125 @@ class mewhisk(ForecastBot):
             return await _run_research_pipeline(query, loop)
 
     # ----------------------------------------------------------
-    # LLM helpers (all gated by _LLM_SEM)
+    # LLM helpers — direct OpenRouter HTTP, gated by _LLM_SEM
     # ----------------------------------------------------------
-    async def _invoke_llm(self, model_name: str, prompt: str) -> str:
+    async def _invoke_openrouter(self, model: str, prompt: str) -> str:
         async with _LLM_SEM:
-            return await self.get_llm(model_name, "llm").invoke(prompt)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, _sync_openrouter_call, model, prompt
+            )
+
+    # Keep parent-compatible signatures
+    async def _invoke_llm(self, model_name: str, prompt: str) -> str:
+        # model_name here is a key like "forecaster_primary" or the full model string
+        model = {
+            "forecaster_primary":    FORECAST_MODEL_PRIMARY,
+            "forecaster_adversarial": FORECAST_MODEL_ADVERSARIAL,
+            "parser":                PARSER_MODEL,
+        }.get(model_name, model_name)
+        return await self._invoke_openrouter(model, prompt)
 
     async def _invoke_with_format_retry(self, model_name: str, prompt: str, _: str) -> str:
         return await self._invoke_llm(model_name, prompt)
 
     # ----------------------------------------------------------
-    # Parsers
+    # Parser — uses OpenRouter directly (no litellm structure_output)
     # ----------------------------------------------------------
     async def _parse_binary(self, raw: str, tag: str) -> Optional[float]:
+        # First try regex extraction from raw text
+        val = extract_binary_prob_from_text(raw)
+        if val is not None:
+            return clamp01(float(val))
+
+        # Fallback: ask parser model to extract
         try:
-            pred: BinaryPrediction = await structure_output(
-                text_to_structure=raw,
-                output_type=BinaryPrediction,
-                model=self.get_llm("parser", "llm"),
-                num_validation_samples=self._structure_output_validation_samples,
+            extract_prompt = (
+                f"Extract the probability from this forecasting text. "
+                f"Reply with ONLY a single decimal between 0 and 1.\n\nText:\n{raw[:800]}"
             )
-            val = safe_float(getattr(pred, "prediction_in_decimal", None), default=None)
-            if val is not None:
-                return clamp01(float(val))
+            result = await self._invoke_openrouter(PARSER_MODEL, extract_prompt)
+            val2 = safe_float(result.strip().split()[0], default=None)
+            if val2 is not None:
+                return clamp01(float(val2))
         except Exception:
-            self._inc_drop(tag, "parse_error_binary_structured")
-        val2 = extract_binary_prob_from_text(raw)
-        if val2 is None:
             self._inc_drop(tag, "parse_error_binary_fallback")
-        return clamp01(float(val2)) if val2 is not None else None
+
+        self._inc_drop(tag, "parse_error_binary_total")
+        return None
 
     async def _parse_mc(
         self, raw: str, question: MultipleChoiceQuestion, tag: str
     ) -> Optional[Dict[str, float]]:
         options = list(question.options)
-        try:
-            pred: PredictedOptionList = await structure_output(
-                text_to_structure=raw,
-                output_type=PredictedOptionList,
-                model=self.get_llm("parser", "llm"),
-                additional_instructions=f"Valid options: {options}.",
-                num_validation_samples=self._structure_output_validation_samples,
-            )
-            pred_dict = {
-                str(po.option_name).strip(): float(po.probability)
-                for po in pred.predicted_options if _is_num(po.probability)
-            }
-            out: Dict[str, float] = {}
-            for opt in options:
-                if opt in pred_dict:
-                    out[opt] = pred_dict[opt]
-                else:
-                    for k, v in pred_dict.items():
-                        if k.casefold() == opt.casefold():
-                            out[opt] = v
-                            break
-            if out:
-                return out
-        except Exception:
-            self._inc_drop(tag, "parse_error_mc_structured")
+
+        # Try regex extraction first
         idx_probs = extract_indexed_mc_probs(raw, len(options))
-        if not idx_probs:
-            self._inc_drop(tag, "parse_error_mc_fallback")
-            return None
-        out2 = {
-            options[i - 1]: float(idx_probs[i])
-            for i in range(1, len(options) + 1) if i in idx_probs
-        }
-        if not out2:
-            self._inc_drop(tag, "parse_error_mc_fallback_empty")
-        return out2 or None
+        if idx_probs:
+            return {
+                options[i - 1]: float(idx_probs[i])
+                for i in range(1, len(options) + 1) if i in idx_probs
+            }
+
+        # Fallback: ask parser model
+        try:
+            opts_str = "\n".join(build_indexed_options(options))
+            extract_prompt = (
+                f"Extract probabilities for these options from the text. "
+                f"Reply ONLY with lines like '1: XX%' summing to 100%.\n\n"
+                f"Options:\n{opts_str}\n\nText:\n{raw[:800]}"
+            )
+            result = await self._invoke_openrouter(PARSER_MODEL, extract_prompt)
+            idx_probs2 = extract_indexed_mc_probs(result, len(options))
+            if idx_probs2:
+                return {
+                    options[i - 1]: float(idx_probs2[i])
+                    for i in range(1, len(options) + 1) if i in idx_probs2
+                }
+        except Exception:
+            pass
+
+        self._inc_drop(tag, "parse_error_mc_total")
+        return None
 
     async def _parse_numeric(
         self, raw: str, question: NumericQuestion, tag: str
     ) -> Optional[NumericDistribution]:
         targets = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
-        try:
-            percentile_list: List[Percentile] = await structure_output(
-                text_to_structure=raw,
-                output_type=list[Percentile],
-                model=self.get_llm("parser", "llm"),
-                num_validation_samples=self._structure_output_validation_samples,
-            )
+
+        # Try regex extraction first
+        extracted = extract_numeric_percentiles(raw, targets)
+        if extracted:
             pts = [
-                Percentile(
-                    value=float(v),
-                    percentile=normalize_percentile(getattr(p, "percentile", 0.5)),
-                )
-                for p in percentile_list
-                if (v := safe_float(getattr(p, "value", None), default=None)) is not None
+                Percentile(percentile=pt, value=float(extracted[pt]))
+                for pt in targets if pt in extracted
             ]
             if pts:
                 return NumericDistribution.from_question(enforce_monotone(pts), question)
+
+        # Fallback: ask parser model
+        try:
+            extract_prompt = (
+                f"Extract percentile values from this text. "
+                f"Reply ONLY with exactly these lines:\n"
+                f"Percentile 10: X\nPercentile 20: X\nPercentile 40: X\n"
+                f"Percentile 60: X\nPercentile 80: X\nPercentile 90: X\n\n"
+                f"Text:\n{raw[:800]}"
+            )
+            result = await self._invoke_openrouter(PARSER_MODEL, extract_prompt)
+            extracted2 = extract_numeric_percentiles(result, targets)
+            if extracted2:
+                pts2 = [
+                    Percentile(percentile=pt, value=float(extracted2[pt]))
+                    for pt in targets if pt in extracted2
+                ]
+                if pts2:
+                    return NumericDistribution.from_question(enforce_monotone(pts2), question)
         except Exception:
-            self._inc_drop(tag, "parse_error_numeric_structured")
-        extracted = extract_numeric_percentiles(raw, targets)
-        if not extracted:
-            self._inc_drop(tag, "parse_error_numeric_fallback")
-            return None
-        pts2 = [
-            Percentile(percentile=pt, value=float(extracted[pt]))
-            for pt in targets if pt in extracted
-        ]
-        return NumericDistribution.from_question(enforce_monotone(pts2), question)
+            pass
+
+        self._inc_drop(tag, "parse_error_numeric_total")
+        return None
 
     # ----------------------------------------------------------
     # Bounds helpers
@@ -617,7 +666,7 @@ class mewhisk(ForecastBot):
             return 50.0
 
     # ----------------------------------------------------------
-    # Prompts — no model names, no internal labels in output
+    # Prompts
     # ----------------------------------------------------------
     def _binary_prompt(self, q: BinaryQuestion, research: str, role: str) -> str:
         return clean_indents(f"""
@@ -693,17 +742,18 @@ class mewhisk(ForecastBot):
         """)
 
     # ----------------------------------------------------------
-    # Per-role runners (with retry on parse failure)
+    # Per-role runners
     # ----------------------------------------------------------
     async def _run_binary_role(
-        self, q: BinaryQuestion, research: str, tag: str, role: str
+        self, q: BinaryQuestion, research: str, tag: str, role: str, model: str
     ) -> ReasonedPrediction[float]:
-        model = f"forecaster_{tag}"
-        raw   = await self._invoke_with_format_retry(model, self._binary_prompt(q, research, role), "bin")
-        val   = await self._parse_binary(raw, tag)
+        raw = await self._invoke_openrouter(model, self._binary_prompt(q, research, role))
+        val = await self._parse_binary(raw, tag)
         if val is None:
             try:
-                raw2 = await self._invoke_llm(model, "Output ONLY:\nProbability: ZZ%\nDecimal: 0.ZZ")
+                raw2 = await self._invoke_openrouter(
+                    model, "Output ONLY:\nProbability: ZZ%\nDecimal: 0.ZZ"
+                )
                 val  = await self._parse_binary(raw2, tag)
                 raw += "\n\n[RETRY]\n" + raw2
             except Exception:
@@ -714,14 +764,15 @@ class mewhisk(ForecastBot):
         return ReasonedPrediction(prediction_value=clamp01(val), reasoning=raw)
 
     async def _run_mc_role(
-        self, q: MultipleChoiceQuestion, research: str, tag: str, role: str
+        self, q: MultipleChoiceQuestion, research: str, tag: str, role: str, model: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        model = f"forecaster_{tag}"
-        raw   = await self._invoke_with_format_retry(model, self._mc_prompt(q, research, role), "mc")
+        raw   = await self._invoke_openrouter(model, self._mc_prompt(q, research, role))
         probs = await self._parse_mc(raw, q, tag)
         if probs is None:
             try:
-                raw2  = await self._invoke_llm(model, "Output ONLY numbered % lines summing to 100%.")
+                raw2  = await self._invoke_openrouter(
+                    model, "Output ONLY numbered % lines summing to 100%."
+                )
                 probs = await self._parse_mc(raw2, q, tag)
                 raw  += "\n\n[RETRY]\n" + raw2
             except Exception:
@@ -738,14 +789,13 @@ class mewhisk(ForecastBot):
         )
 
     async def _run_numeric_role(
-        self, q: NumericQuestion, research: str, tag: str, role: str
+        self, q: NumericQuestion, research: str, tag: str, role: str, model: str
     ) -> ReasonedPrediction[NumericDistribution]:
-        model = f"forecaster_{tag}"
-        raw   = await self._invoke_with_format_retry(model, self._numeric_prompt(q, research, role), "num")
-        dist  = await self._parse_numeric(raw, q, tag)
+        raw  = await self._invoke_openrouter(model, self._numeric_prompt(q, research, role))
+        dist = await self._parse_numeric(raw, q, tag)
         if dist is None:
             try:
-                raw2 = await self._invoke_llm(
+                raw2 = await self._invoke_openrouter(
                     model,
                     "Output ONLY:\nPercentile 10: X\nPercentile 20: X\nPercentile 40: X\n"
                     "Percentile 60: X\nPercentile 80: X\nPercentile 90: X",
@@ -763,17 +813,16 @@ class mewhisk(ForecastBot):
 
     # Required single-agent overrides (used when _make_prediction is bypassed)
     async def _run_forecast_on_binary(self, q, research):
-        return await self._run_binary_role(q, research, "sonnet", "PRIMARY")
+        return await self._run_binary_role(q, research, "primary", "PRIMARY", FORECAST_MODEL_PRIMARY)
 
     async def _run_forecast_on_multiple_choice(self, q, research):
-        return await self._run_mc_role(q, research, "sonnet", "PRIMARY")
+        return await self._run_mc_role(q, research, "primary", "PRIMARY", FORECAST_MODEL_PRIMARY)
 
     async def _run_forecast_on_numeric(self, q, research):
-        return await self._run_numeric_role(q, research, "sonnet", "PRIMARY")
+        return await self._run_numeric_role(q, research, "primary", "PRIMARY", FORECAST_MODEL_PRIMARY)
 
     # ----------------------------------------------------------
-    # Clean reasoning for public Metaculus comments.
-    # Strips internal stat lines, agent labels, and separator lines.
+    # Clean reasoning for public Metaculus comments
     # ----------------------------------------------------------
     @staticmethod
     def _clean_for_publish(reasoning: str) -> str:
@@ -787,40 +836,37 @@ class mewhisk(ForecastBot):
             if stripped == "---":
                 continue
             output_lines.append(line)
-        # Collapse runs of blank lines to a single blank
-        cleaned  = "\n".join(output_lines)
-        cleaned  = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = "\n".join(output_lines)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
 
     # ----------------------------------------------------------
     # Dual-agent prediction core
-    # Sonnet + Opus run concurrently; results are blended with
-    # weight-renormalisation so one failure degrades gracefully.
     # ----------------------------------------------------------
     async def _make_prediction(self, question: MetaculusQuestion, research: str):
         async with _Q_SEM:
             preds:      List[Tuple[str, Any]] = []
             reasonings: List[str]             = []
-            w_s, w_o = 0.55, 0.45
+            w_p, w_a = 0.55, 0.45
 
-            async def run_agent(tag: str, role: str) -> None:
+            async def run_agent(tag: str, role: str, model: str) -> None:
                 try:
                     if isinstance(question, BinaryQuestion):
-                        p = await self._run_binary_role(question, research, tag, role)
+                        p = await self._run_binary_role(question, research, tag, role, model)
                     elif isinstance(question, MultipleChoiceQuestion):
-                        p = await self._run_mc_role(question, research, tag, role)
+                        p = await self._run_mc_role(question, research, tag, role, model)
                     else:
-                        p = await self._run_numeric_role(question, research, tag, role)
-                    label = "A" if tag == "sonnet" else "B"
+                        p = await self._run_numeric_role(question, research, tag, role, model)
+                    label = "A" if tag == "primary" else "B"
                     preds.append((tag, p.prediction_value))
                     reasonings.append(f"[AGENT_{label}]\n{p.reasoning}")
                 except Exception as e:
                     logger.error(f"Agent {tag} failed: {e}")
 
-            # Sonnet + Opus in parallel
+            # Primary + Adversarial in parallel
             await asyncio.gather(
-                run_agent("sonnet", "PRIMARY"),
-                run_agent("opus",   "ADVERSARIAL_CHECKER"),
+                run_agent("primary",    "PRIMARY",             FORECAST_MODEL_PRIMARY),
+                run_agent("adversarial","ADVERSARIAL_CHECKER", FORECAST_MODEL_ADVERSARIAL),
             )
 
             if not preds:
@@ -834,18 +880,18 @@ class mewhisk(ForecastBot):
                         return v
                 return None
 
-            s_pred = get_val("sonnet")
-            o_pred = get_val("opus")
+            p_pred = get_val("primary")
+            a_pred = get_val("adversarial")
 
             # ---- BINARY ----
             if isinstance(question, BinaryQuestion):
-                s_val = float(s_pred) if s_pred is not None and _is_num(s_pred) else None
-                o_val = float(o_pred) if o_pred is not None and _is_num(o_pred) else None
-                final = clamp01(_weighted_blend([(w_s, s_val), (w_o, o_val)]))
+                p_val = float(p_pred) if p_pred is not None and _is_num(p_pred) else None
+                a_val = float(a_pred) if a_pred is not None and _is_num(a_pred) else None
+                final = clamp01(_weighted_blend([(w_p, p_val), (w_a, a_val)]))
                 pre   = final
                 if self.extremize_enabled:
                     final = extremize_binary(final, self.extremize_k_binary)
-                np_       = [v for v in [s_val, o_val] if v is not None] or [0.5]
+                np_       = [v for v in [p_val, a_val] if v is not None] or [0.5]
                 m, md, sd = mean(np_), safe_median(np_), stdev(np_)
                 lo, hi    = ci90(np_)
                 stats = (
@@ -869,12 +915,12 @@ class mewhisk(ForecastBot):
                         if isinstance(pol, PredictedOptionList) else {}
                     )
 
-                s_d = p2d(s_pred) if s_pred is not None else {}
-                o_d = p2d(o_pred) if o_pred is not None else {}
+                p_d = p2d(p_pred) if p_pred is not None else {}
+                a_d = p2d(a_pred) if a_pred is not None else {}
                 blended: Dict[str, float] = {}
                 for opt in options:
-                    sv, ov       = s_d.get(opt), o_d.get(opt)
-                    blended[opt] = _weighted_blend([(w_s, sv), (w_o, ov)]) or 1e-6
+                    pv, av       = p_d.get(opt), a_d.get(opt)
+                    blended[opt] = _weighted_blend([(w_p, pv), (w_a, av)]) or 1e-6
                 total   = sum(blended.values())
                 blended = (
                     {k: v / total for k, v in blended.items()}
@@ -896,7 +942,7 @@ class mewhisk(ForecastBot):
                     reasoning=self._clean_for_publish(stats + "\n\n" + internal_reasoning),
                 )
 
-            # ---- NUMERIC (no extremization — preserve distributional calibration) ----
+            # ---- NUMERIC (no extremization) ----
             if isinstance(question, NumericQuestion):
                 targets = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
 
@@ -909,15 +955,14 @@ class mewhisk(ForecastBot):
                         }
                     return {}
 
-                s_m = d2m(s_pred) if s_pred is not None else {}
-                o_m = d2m(o_pred) if o_pred is not None else {}
+                p_m = d2m(p_pred) if p_pred is not None else {}
+                a_m = d2m(a_pred) if a_pred is not None else {}
                 pts: List[Percentile] = []
                 for pt in targets:
-                    sv = interpolate_percentile(s_m, pt) if s_m else None
-                    ov = interpolate_percentile(o_m, pt) if o_m else None
-                    v  = _weighted_blend([(w_s, sv), (w_o, ov)])
-                    # _weighted_blend returns 0.5 when both are None — replace with domain midpoint
-                    if sv is None and ov is None:
+                    pv = interpolate_percentile(p_m, pt) if p_m else None
+                    av = interpolate_percentile(a_m, pt) if a_m else None
+                    v  = _weighted_blend([(w_p, pv), (w_a, av)])
+                    if pv is None and av is None:
                         v = self._numeric_midpoint(question)
                     pts.append(Percentile(percentile=pt, value=float(v)))
                 pts = enforce_monotone(pts)
@@ -949,7 +994,7 @@ class mewhisk(ForecastBot):
 # MAIN
 # ============================================================
 MINIBENCH_ID            = "minibench"
-SPRING_AI_TOURNAMENT_ID = "32916"    # update to real ID if it changes
+SPRING_AI_TOURNAMENT_ID = "32916"
 
 if __name__ == "__main__":
     logging.getLogger("litellm").setLevel(logging.WARNING)
@@ -957,9 +1002,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "mewhisk: AgentRouter | dual online-model research | conservative extremize\n"
-            "Research models: perplexity/sonar-pro + openai/gpt-4o-search-preview (parallel)\n"
-            "Forecast models: claude-sonnet-4-6 (primary) + claude-opus-4-6 (adversarial)"
+            "mewhisk: AgentRouter research | OpenRouter free-tier forecasters\n"
+            "Research : perplexity/sonar-pro + openai/gpt-4o-search-preview (parallel, AgentRouter)\n"
+            "Primary  : qwen/qwen3.6-plus:free (OpenRouter, weight=0.55)\n"
+            "Adversarial: nvidia/nemotron-super-49b-v1:free (OpenRouter, weight=0.45)"
         )
     )
     parser.add_argument(
@@ -972,19 +1018,11 @@ if __name__ == "__main__":
     parser.add_argument("--extremize-k-mc",     type=float, default=1.12)
     parser.add_argument(
         "--research-model-1", type=str, default=None,
-        help=(
-            "Primary online research model (env: MEWHISK_RESEARCH_MODEL_1). "
-            "Must be web-search-capable and available on AgentRouter. "
-            "Default: perplexity/sonar-pro"
-        ),
+        help="Primary research model (env: MEWHISK_RESEARCH_MODEL_1). Default: perplexity/sonar-pro",
     )
     parser.add_argument(
         "--research-model-2", type=str, default=None,
-        help=(
-            "Secondary online research model (env: MEWHISK_RESEARCH_MODEL_2). "
-            "Must be web-search-capable and available on AgentRouter. "
-            "Default: openai/gpt-4o-search-preview"
-        ),
+        help="Secondary research model (env: MEWHISK_RESEARCH_MODEL_2). Default: openai/gpt-4o-search-preview",
     )
     args = parser.parse_args()
 
@@ -995,8 +1033,8 @@ if __name__ == "__main__":
         os.environ["MEWHISK_RESEARCH_MODEL_2"] = args.research_model_2
         RESEARCH_MODEL_2 = args.research_model_2  # noqa: F811
 
-    if not AGENTROUTER_API_KEY:
-        logger.error("AGENTROUTER_API_KEY is required.")
+    if not _OPENROUTER_KEY:
+        logger.error("OPENROUTER_API_KEY is required for forecast calls.")
         raise SystemExit(1)
 
     bot = mewhisk(
