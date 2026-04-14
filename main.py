@@ -5,10 +5,10 @@ All LLM calls (research + forecast + parse) go through OpenRouter via direct
 HTTP, using the same pattern as the official metaculus forecasting-tools template.
 No AgentRouter dependency.
 
-Primary forecaster  : meta-llama/llama-4-maverick:free       (w=0.55)
-Adversarial checker : mistralai/mistral-small-3.2-24b-instruct:free  (w=0.45)
+Primary forecaster  : openrouter/openrouter:free       (w=0.55)
+Adversarial checker : openrouter/openrouter:free  (w=0.45)
 Research            : both models in parallel, results concatenated
-Parser              : meta-llama/llama-4-maverick:free
+Parser              : openrouter/openrouter:free
 
 Extremization (per tournament):
   minibench  → 5-trigger aggressive system
@@ -80,11 +80,11 @@ if not _OPENROUTER_KEY:
 # ============================================================
 FORECAST_MODEL_PRIMARY     = os.getenv(
     "MEWHISK_FORECAST_PRIMARY",
-    "meta-llama/llama-4-maverick:free",        # fast, strong reasoning
+    "openrouter/openrouter:free",        # fast, strong reasoning
 )
 FORECAST_MODEL_ADVERSARIAL = os.getenv(
     "MEWHISK_FORECAST_ADVERSARIAL",
-    "mistralai/mistral-small-3.2-24b-instruct:free",  # good adversarial checker
+    "openrouter/openrouter:free",  # good adversarial checker
 )
 RESEARCH_MODEL_1 = os.getenv("MEWHISK_RESEARCH_MODEL_1", FORECAST_MODEL_PRIMARY)
 RESEARCH_MODEL_2 = os.getenv("MEWHISK_RESEARCH_MODEL_2", FORECAST_MODEL_ADVERSARIAL)
