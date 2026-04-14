@@ -5,10 +5,10 @@ All LLM calls (research + forecast + parse) go through OpenRouter via direct
 HTTP, using the same pattern as the official metaculus forecasting-tools template.
 No AgentRouter dependency.
 
-Primary forecaster  : openrouter/meta-llama/llama-3.1-8b-instruct:free       (w=0.55)
-Adversarial checker : openrouter/mistralai/mistral-7b-instruct:free  (w=0.45)
-Research            : openrouter/meta-llama/llama-3.1-8b-instruct:free + openrouter/google/gemma-3-4b-it:free
-Parser              : openrouter/meta-llama/llama-3.1-8b-instruct:free
+Primary forecaster  : meta-llama/llama-3.1-8b-instruct:free       (w=0.55)
+Adversarial checker : mistralai/mistral-7b-instruct:free          (w=0.45)
+Research            : meta-llama/llama-3.1-8b-instruct:free + google/gemma-2-9b-it:free
+Parser              : meta-llama/llama-3.1-8b-instruct:free
 
 Extremization (per tournament):
   minibench  → 5-trigger aggressive system
@@ -24,6 +24,9 @@ Env vars required:
 Optional overrides:
   MEWHISK_FORECAST_PRIMARY    MEWHISK_FORECAST_ADVERSARIAL
   MEWHISK_RESEARCH_MODEL_1    MEWHISK_RESEARCH_MODEL_2
+
+⚠️  MODEL ID FORMAT: Use bare IDs like "meta-llama/llama-3.1-8b-instruct:free"
+    Do NOT include "openrouter/" prefix — API expects provider/model:tier format.
 """
 
 import argparse
@@ -76,24 +79,35 @@ if not _OPENROUTER_KEY:
 
 # ============================================================
 # Model selection — all OpenRouter free tier, verified stable.
+# ⚠️  IMPORTANT: Use BARE model IDs (NO "openrouter/" prefix)
+#    API expects: "provider/model:tier" format
 # Override any of these via env var or CLI arg.
 # ============================================================
 FORECAST_MODEL_PRIMARY     = os.getenv(
     "MEWHISK_FORECAST_PRIMARY",
-    "openrouter/meta-llama/llama-3.1-8b-instruct:free",        # fast, strong reasoning
+    "meta-llama/llama-3.1-8b-instruct:free",        # ✅ fast, strong reasoning
 )
 FORECAST_MODEL_ADVERSARIAL = os.getenv(
     "MEWHISK_FORECAST_ADVERSARIAL",
-    "openrouter/mistralai/mistral-7b-instruct:free",  # good adversarial checker
+    "mistralai/mistral-7b-instruct:free",           # ✅ good adversarial checker
 )
 RESEARCH_MODEL_1 = os.getenv(
     "MEWHISK_RESEARCH_MODEL_1",
-    "openrouter/meta-llama/llama-3.1-8b-instruct:free",
+    "meta-llama/llama-3.1-8b-instruct:free",        # ✅ verified available
 )
 RESEARCH_MODEL_2 = os.getenv(
     "MEWHISK_RESEARCH_MODEL_2",
-    "openrouter/google/gemma-3-4b-it:free",
+    "google/gemma-2-9b-it:free",                    # ✅ verified available (was gemma-3-4b-it)
 )
+
+# ============================================================
+# Fallback models for resilience when primary free models fail
+# ============================================================
+_FALLBACK_MODELS = {
+    "meta-llama/llama-3.1-8b-instruct:free": "mistralai/mistral-7b-instruct:free",
+    "google/gemma-2-9b-it:free": "meta-llama/llama-3.1-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free": "meta-llama/llama-3.1-8b-instruct:free",
+}
 
 # ============================================================
 # Concurrency controls
@@ -158,6 +172,21 @@ def normalize_percentile(p: Any) -> float:
 
 def clamp01(p: float, lo: float = 0.01, hi: float = 0.99) -> float:
     return max(lo, min(hi, float(p)))
+
+
+# ============================================================
+# Model validation helper — catch config errors early
+# ============================================================
+def _validate_openrouter_model(model_id: str) -> bool:
+    """Check if model ID format is valid for OpenRouter API."""
+    if not model_id or "/" not in model_id:
+        logger.error(f"Invalid model format: '{model_id}' — expected 'provider/model:tier'")
+        return False
+    # Reject common mistake: including 'openrouter/' prefix
+    if model_id.startswith("openrouter/"):
+        logger.error(f"Invalid model format: '{model_id}' — remove 'openrouter/' prefix")
+        return False
+    return True
 
 
 # ============================================================
@@ -404,7 +433,7 @@ def _numeric_midpoint(q: NumericQuestion) -> float:
 
 
 # ============================================================
-# OpenRouter HTTP helper — retry on 429 / timeout
+# OpenRouter HTTP helper — retry on 429 / timeout, with detailed error logging
 # ============================================================
 def _sync_openrouter(
     model: str,
@@ -412,6 +441,7 @@ def _sync_openrouter(
     max_tokens: int = 1200,
     temperature: float = 0.3,
     retries: int = 3,
+    use_fallback: bool = True,
 ) -> str:
     headers = {
         "Authorization": f"Bearer {_OPENROUTER_KEY}",
@@ -422,6 +452,7 @@ def _sync_openrouter(
     payload = {"model": model, "messages": messages,
                 "max_tokens": max_tokens, "temperature": temperature}
     last_err: Exception = RuntimeError("no attempts")
+    current_model = model
 
     for attempt in range(retries):
         try:
@@ -431,32 +462,49 @@ def _sync_openrouter(
             )
             if resp.status_code == 429:
                 wait = 5 * (2 ** attempt)
-                logger.warning(f"429 on {model} — sleeping {wait}s (attempt {attempt+1})")
+                logger.warning(f"429 on {current_model} — sleeping {wait}s (attempt {attempt+1})")
                 time.sleep(wait)
                 last_err = RuntimeError(f"429 after {attempt+1} attempts")
                 continue
+            
+            # Log detailed error for 4xx/5xx responses
+            if resp.status_code >= 400:
+                try:
+                    err_json = resp.json()
+                    logger.error(f"OpenRouter {current_model} error {resp.status_code}: {err_json}")
+                except Exception:
+                    logger.error(f"OpenRouter {current_model} error {resp.status_code}: {resp.text[:300]}")
+            
             resp.raise_for_status()
             return (resp.json()["choices"][0]["message"]["content"] or "").strip()
+            
         except _requests.exceptions.Timeout:
-            last_err = RuntimeError(f"Timeout on {model} attempt {attempt+1}")
+            last_err = RuntimeError(f"Timeout on {current_model} attempt {attempt+1}")
             logger.warning(str(last_err))
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
-                logger.warning(f"OpenRouter {model} attempt {attempt+1} error: {e}")
+                logger.warning(f"OpenRouter {current_model} attempt {attempt+1} error: {e}")
+                # Optional: try fallback model on second attempt if enabled
+                if use_fallback and attempt == 1 and model in _FALLBACK_MODELS:
+                    fallback = _FALLBACK_MODELS[model]
+                    logger.info(f"Retrying with fallback model: {fallback}")
+                    payload["model"] = fallback
+                    current_model = fallback
 
     raise RuntimeError(f"OpenRouter failed for {model}: {last_err}") from last_err
 
 
 async def _call(
     model: str, messages: List[Dict[str, str]],
-    max_tokens: int = 1200, temperature: float = 0.3
+    max_tokens: int = 1200, temperature: float = 0.3,
+    use_fallback: bool = True,
 ) -> str:
     """Async OpenRouter call, gated by _LLM_SEM."""
     async with _LLM_SEM:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, _sync_openrouter, model, messages, max_tokens, temperature
+            None, _sync_openrouter, model, messages, max_tokens, temperature, 3, use_fallback
         )
 
 
@@ -595,6 +643,17 @@ class mewhisk(ForecastBot):
         self.extremize_k_mc     = float(extremize_k_mc)
         self._active_tournament: str       = ""
         self._drop_counts:       Dict[str, int] = {}
+        
+        # Validate model IDs at startup — catch config errors early
+        for name, model in [
+            ("PRIMARY", FORECAST_MODEL_PRIMARY),
+            ("ADVERSARIAL", FORECAST_MODEL_ADVERSARIAL),
+            ("RESEARCH_1", RESEARCH_MODEL_1),
+            ("RESEARCH_2", RESEARCH_MODEL_2),
+        ]:
+            if not _validate_openrouter_model(model):
+                logger.critical(f"Invalid {name} model config: '{model}' — bot will fail on API calls")
+        
         logger.info(
             f"mewhisk ready | primary={FORECAST_MODEL_PRIMARY} | "
             f"adversarial={FORECAST_MODEL_ADVERSARIAL} | "
@@ -919,7 +978,7 @@ if __name__ == "__main__":
     parser.add_argument("--extremize-k-binary",   type=float, default=1.15)
     parser.add_argument("--extremize-k-mc",       type=float, default=1.12)
     parser.add_argument("--forecast-primary",     type=str,   default=None,
-                        help="Override primary model (bare OpenRouter id)")
+                        help="Override primary model (bare OpenRouter id, e.g. 'meta-llama/llama-3.1-8b-instruct:free')")
     parser.add_argument("--forecast-adversarial", type=str,   default=None,
                         help="Override adversarial model (bare OpenRouter id)")
     parser.add_argument("--research-model-1",     type=str,   default=None)
@@ -933,6 +992,12 @@ if __name__ == "__main__":
 
     if not _OPENROUTER_KEY:
         logger.error("OPENROUTER_API_KEY is required.")
+        raise SystemExit(1)
+
+    # Final validation before launch
+    all_models = [FORECAST_MODEL_PRIMARY, FORECAST_MODEL_ADVERSARIAL, RESEARCH_MODEL_1, RESEARCH_MODEL_2]
+    if not all(_validate_openrouter_model(m) for m in all_models):
+        logger.critical("One or more model IDs are invalid — aborting to prevent runtime failures")
         raise SystemExit(1)
 
     bot = mewhisk(
@@ -961,3 +1026,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal: {e}")
         raise SystemExit(1)
+        
