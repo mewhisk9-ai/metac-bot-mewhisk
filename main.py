@@ -7,7 +7,7 @@ from typing import Literal
 
 import numpy as np
 import requests
-from duckduckgo-search import DDGS
+from duckduckgo_search import DDGS
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
