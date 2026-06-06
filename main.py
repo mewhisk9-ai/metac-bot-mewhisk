@@ -3,11 +3,8 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Literal
 
 import numpy as np
-import requests
-from duckduckgo_search import DDGS
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -25,33 +22,25 @@ from forecasting_tools import (
     structure_output,
 )
 
-# -----------------------------
-# Logging setup
-# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("ConservativeHybridBot")
 
-# -----------------------------
-# Free OpenRouter fallback models (no credits needed)
-# -----------------------------
 OPENROUTER_FREE_MODELS = [
-    "openrouter/free",
-    "openrouter/free",
     "openrouter/google/gemma-3-27b-it:free",
+    "openrouter/mistralai/mistral-7b-instruct:free",
 ]
 
 
 class ConservativeHybridBot(ForecastBot):
     """
     Conservative forecasting bot using:
-    - Research: DuckDuckGo (web + news) + Perplexity (OpenRouter)
-    - Models: gpt-5, gpt-4.1-mini, claude-sonnet-4 (OpenRouter)
+    - Research: Perplexity Sonar via OpenRouter
+    - Models: gpt-5.5, o4-mini-deep-research, claude-opus-4.1 (committee)
     - Fallback: free OpenRouter models if primary models fail
     - Aggregation: Median across 3 forecasts
-    - Compliance: structure_output + NumericDistribution.from_question()
     """
 
     _max_concurrent_questions = 1
@@ -65,59 +54,29 @@ class ConservativeHybridBot(ForecastBot):
             "researcher": "openrouter/perplexity/sonar",
         }
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ddgs = DDGS()
-
     # -----------------------------
-    # Multi-Source Research (DuckDuckGo)
+    # Research via Perplexity Sonar
     # -----------------------------
-    def call_ddg_web(self, query: str) -> str:
-        """DuckDuckGo general web search — replaces Tavily."""
-        try:
-            results = self.ddgs.text(query, max_results=5)
-            if not results:
-                return ""
-            return "\n".join(
-                [f"- {r.get('title', '')}: {r.get('body', '')}" for r in results]
-            )
-        except Exception as e:
-            return f"DDG web search failed: {e}"
-
-    def call_ddg_news(self, query: str) -> str:
-        """DuckDuckGo news search — replaces NewsAPI."""
-        try:
-            results = self.ddgs.news(query, max_results=5)
-            if not results:
-                return ""
-            return "\n".join(
-                [
-                    f"- [{r.get('date', '')}] {r.get('title', '')}: {r.get('body', '')}"
-                    for r in results
-                ]
-            )
-        except Exception as e:
-            return f"DDG news search failed: {e}"
-
     async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            loop = asyncio.get_running_loop()
-            tasks = {
-                "ddg_web": loop.run_in_executor(None, self.call_ddg_web, question.question_text),
-                "ddg_news": loop.run_in_executor(None, self.call_ddg_news, question.question_text),
-                "perplexity": self.get_llm("researcher", "llm").invoke(question.question_text),
-            }
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            raw_research = ""
-            for i, result in enumerate(results):
-                raw_research += f"--- SOURCE {list(tasks.keys())[i].upper()} ---\n{result}\n\n"
-            return raw_research
+        researcher = self.get_llm("researcher", "llm")
+        prompt = (
+            f"Research the following forecasting question thoroughly. "
+            f"Provide relevant facts, recent news, base rates, and expert opinions.\n\n"
+            f"Question: {question.question_text}\n"
+            f"Background: {question.background_info}\n"
+            f"Resolution criteria: {question.resolution_criteria}"
+        )
+        try:
+            result = await researcher.invoke(prompt)
+            return f"--- PERPLEXITY SONAR RESEARCH ---\n{result}\n"
+        except Exception as e:
+            logger.warning(f"Perplexity research failed: {e}")
+            return f"--- RESEARCH UNAVAILABLE ---\nError: {e}\n"
 
     # -----------------------------
     # LLM invocation with free fallback
     # -----------------------------
     async def _invoke_with_fallback(self, llm_key: str, prompt: str) -> str:
-        """Try primary LLM; on failure, fall through to free OpenRouter models."""
         primary_llm = self.get_llm(llm_key, "llm")
         try:
             return await primary_llm.invoke(prompt)
@@ -133,7 +92,6 @@ class ConservativeHybridBot(ForecastBot):
             raise RuntimeError("All models (primary + free fallbacks) failed.")
 
     async def _structure_with_fallback(self, reasoning: str, output_type, **kwargs):
-        """Try primary parser; on failure, fall through to free OpenRouter models."""
         primary_parser = self.get_llm("parser", "llm")
         try:
             return await structure_output(reasoning, output_type, model=primary_parser, **kwargs)
@@ -149,7 +107,7 @@ class ConservativeHybridBot(ForecastBot):
             raise RuntimeError("All parsers (primary + free fallbacks) failed.")
 
     # -----------------------------
-    # Conservative Forecasting with Committee
+    # Single forecast (one model)
     # -----------------------------
     async def _single_forecast(self, question, research: str, model_override: str = None):
         original_default = None
@@ -176,7 +134,7 @@ class ConservativeHybridBot(ForecastBot):
                 Consider:
                 (a) Time until resolution
                 (b) Status quo (world changes slowly)
-                (c) Base rates and community estimates (e.g., 30% for major population drops)
+                (c) Base rates and community estimates
 
                 Be humble. Avoid overconfidence.
 
@@ -333,7 +291,7 @@ class ConservativeHybridBot(ForecastBot):
 
 
 # -----------------------------
-# Entrypoint — Tournament Only
+# Entrypoint
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Conservative Hybrid Bot.")
