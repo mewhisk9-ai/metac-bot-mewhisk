@@ -37,10 +37,10 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # Free Model IDs (OpenRouter)
 # Slugs can change — verify at openrouter.ai/models
 # -----------------------------
-FREE_DEFAULT    = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"  # Strong reasoner — main forecasting
-FREE_PARSER     = "openrouter/openai/gpt-oss-120b"                     # Fast & reliable — structured output
-FREE_SUMMARIZER = "openrouter/openai/gpt-oss-20b"                      # Capable general model
-FREE_RESEARCHER = "openrouter/free"                      # Good for research synthesis
+FREE_DEFAULT    = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+FREE_PARSER     = "openrouter/openai/gpt-oss-120b"
+FREE_SUMMARIZER = "openrouter/openai/gpt-oss-20b"
+FREE_RESEARCHER = "openrouter/free"  # auto-router picks best available free model
 
 # Committee of 3 diverse free models for ensemble forecasting
 FREE_COMMITTEE = [
@@ -48,6 +48,9 @@ FREE_COMMITTEE = [
     "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
     "openrouter/openai/gpt-oss-20b",
 ]
+
+# Research is considered "failed" if shorter than this
+RESEARCH_MIN_CHARS = 150
 
 # -----------------------------
 # Logging setup
@@ -60,17 +63,12 @@ logger = logging.getLogger("mewhisk")
 
 
 def _is_child_question(question: MetaculusQuestion) -> bool:
-    """
-    Returns True if this question is a child/sub-question of a group.
-    Child questions should be skipped — the parent handles aggregation on Metaculus.
-    """
+    """Returns True if this is a sub-question of a group — skip these."""
     try:
-        # forecasting-tools exposes group_id or parent_id on sub-questions
         if getattr(question, "group_id", None) is not None:
             return True
         if getattr(question, "parent_id", None) is not None:
             return True
-        # Some versions nest it under question_type or type
         qtype = str(getattr(question, "question_type", "") or "").lower()
         if qtype in ("group", "conditional", "sub_question"):
             return True
@@ -79,13 +77,34 @@ def _is_child_question(question: MetaculusQuestion) -> bool:
     return False
 
 
+def _research_ok(research: str) -> bool:
+    """Returns True if research has enough content to be useful."""
+    return bool(research) and len(research.strip()) >= RESEARCH_MIN_CHARS
+
+
+def _research_instruction(research: str) -> str:
+    """Returns the research grounding instruction to inject into prompts."""
+    if _research_ok(research):
+        return (
+            "You MUST ground your probability estimate in the research below. "
+            "For each option/outcome, cite at least one specific fact from the research "
+            "that supports or undermines it. If the research contradicts your prior, "
+            "update toward the research."
+        )
+    return (
+        "WARNING: Research is unavailable or returned no useful content. "
+        "Your estimate should reflect higher uncertainty — widen your confidence "
+        "interval and lean toward base rates rather than strong opinions."
+    )
+
+
 class mewhisk(ForecastBot):
     """
     Conservative forecasting bot using:
     - Research: Tavily + LLM researcher (OpenRouter free)
     - Models: Nemotron 120B, GPT-OSS 120B, GPT-OSS 20B (via OpenRouter)
     - Aggregation: Median across 3 forecasts
-    - Compliance: structure_output + NumericDistribution.from_question()
+    - Research grounding: prompts require citing research; failed research widens priors
     - Child/parent: skips child questions automatically
     """
 
@@ -117,7 +136,6 @@ class mewhisk(ForecastBot):
             return f"Tavily failed: {e}"
 
     async def run_research(self, question: MetaculusQuestion) -> str:
-        # Skip research for child questions
         if _is_child_question(question):
             logger.info("Skipping research for child question: %s", getattr(question, "question_text", "")[:80])
             return ""
@@ -132,6 +150,9 @@ class mewhisk(ForecastBot):
             raw_research = ""
             for i, result in enumerate(results):
                 raw_research += f"--- SOURCE {list(tasks.keys())[i].upper()} ---\n{result}\n\n"
+
+            if not _research_ok(raw_research):
+                logger.warning("Research insufficient for Q: %s", getattr(question, "question_text", "")[:80])
             return raw_research
 
     # -----------------------------
@@ -142,6 +163,9 @@ class mewhisk(ForecastBot):
             self._llms["default"] = GeneralLlm(model=model_override)
             self._llms["parser"]  = GeneralLlm(model=FREE_PARSER)
 
+        grounding = _research_instruction(research)
+        research_block = research.strip() or "(no research available)"
+
         if isinstance(question, BinaryQuestion):
             prompt = clean_indents(f"""
             You are a professional forecaster known for conservative, well-calibrated predictions.
@@ -150,16 +174,19 @@ class mewhisk(ForecastBot):
             Background: {question.background_info}
             Resolution criteria: {question.resolution_criteria}
             Fine print: {question.fine_print}
-            Research: {research}
             Today: {datetime.now().strftime("%Y-%m-%d")}
+
+            {grounding}
+
+            Research:
+            {research_block}
 
             Consider:
             (a) Time until resolution
             (b) Status quo (world changes slowly)
-            (c) Base rates and community estimates (e.g., 30% for major population drops)
+            (c) Base rates — if research is missing, stay close to them
 
             Be humble. Avoid overconfidence.
-
             End with: "Probability: ZZ%"
             """)
             reasoning = await self.get_llm("default", "llm").invoke(prompt)
@@ -168,17 +195,21 @@ class mewhisk(ForecastBot):
 
         elif isinstance(question, MultipleChoiceQuestion):
             prompt = clean_indents(f"""
-            Conservative forecaster mode.
+            You are a conservative forecaster.
 
             Question: {question.question_text}
             Options: {question.options}
             Background: {question.background_info}
             Resolution: {question.resolution_criteria}
-            Research: {research}
             Today: {datetime.now().strftime("%Y-%m-%d")}
 
-            Assign probabilities. Do not assign 0% to any option unless logically impossible.
+            {grounding}
 
+            Research:
+            {research_block}
+
+            For each option, cite a specific fact from the research that supports your estimate.
+            Assign non-zero probability to every option unless logically impossible.
             End with probabilities for each option in order.
             """)
             reasoning = await self.get_llm("default", "llm").invoke(prompt)
@@ -191,7 +222,7 @@ class mewhisk(ForecastBot):
             lower_msg = f"Lower bound: {'open' if question.open_lower_bound else 'closed'} at {question.lower_bound or question.nominal_lower_bound}"
             upper_msg = f"Upper bound: {'open' if question.open_upper_bound else 'closed'} at {question.upper_bound or question.nominal_upper_bound}"
             prompt = clean_indents(f"""
-            Conservative forecaster. Set wide 90/10 intervals.
+            You are a conservative forecaster. Set wide 90/10 intervals.
 
             Question: {question.question_text}
             Units: {question.unit_of_measure or 'Infer from context'}
@@ -199,11 +230,15 @@ class mewhisk(ForecastBot):
             Resolution: {question.resolution_criteria}
             {lower_msg}
             {upper_msg}
-            Research: {research}
             Today: {datetime.now().strftime("%Y-%m-%d")}
 
-            Consider status quo, trends, expert views, and black swans.
+            {grounding}
 
+            Research:
+            {research_block}
+
+            Cite specific facts from the research when setting each percentile.
+            Consider status quo, trends, expert views, and black swans.
             Provide percentiles: 10, 20, 40, 60, 80, 90.
             """)
             reasoning = await self.get_llm("default", "llm").invoke(prompt)
@@ -226,7 +261,15 @@ class mewhisk(ForecastBot):
             pred, reason = await self._single_forecast(question, research, model_override=model)
             forecasts.append(pred)
             reasonings.append(reason)
-        return ReasonedPrediction(prediction_value=float(np.median(forecasts)), reasoning=" | ".join(reasonings))
+
+        p_final = float(np.median(forecasts))
+
+        # If research failed, blend toward 0.5 to reflect higher uncertainty
+        if not _research_ok(research):
+            logger.warning("Research failed — blending binary forecast toward 0.5")
+            p_final = 0.6 * p_final + 0.4 * 0.5
+
+        return ReasonedPrediction(prediction_value=p_final, reasoning=" | ".join(reasonings))
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
         if _is_child_question(question):
@@ -247,6 +290,7 @@ class mewhisk(ForecastBot):
             reasonings.append(reason)
 
         option_list = list(question.options)
+        n = len(option_list)
 
         # Build per-model probability maps — PredictedOption is Pydantic, use attribute access
         per_model_maps = []
@@ -266,6 +310,13 @@ class mewhisk(ForecastBot):
         median_probs = np.median(mat, axis=0)
         median_probs = np.maximum(median_probs, 1e-6)
         median_probs = median_probs / median_probs.sum()
+
+        # If research failed, blend toward uniform to reflect higher uncertainty
+        if not _research_ok(research):
+            logger.warning("Research failed — blending MC forecast toward uniform")
+            uniform = np.full(n, 1.0 / n)
+            median_probs = 0.6 * median_probs + 0.4 * uniform
+            median_probs = median_probs / median_probs.sum()
 
         median_forecast = PredictedOptionList(predicted_options=[
             PredictedOption(option_name=opt, probability=float(p))
@@ -289,6 +340,7 @@ class mewhisk(ForecastBot):
             pred, reason = await self._single_forecast(question, research, model_override=model)
             forecasts.append(pred)
             reasonings.append(reason)
+
         target_percentiles = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
         aggregated = []
         for p in target_percentiles:
@@ -301,6 +353,7 @@ class mewhisk(ForecastBot):
                 else:
                     values.append(0.0)
             aggregated.append(Percentile(percentile=p, value=float(np.median(values))))
+
         return ReasonedPrediction(
             prediction_value=NumericDistribution.from_question(aggregated, question),
             reasoning=" | ".join(reasonings)
@@ -324,7 +377,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=False,
+        skip_previously_forecasted_questions=True,
     )
 
     try:
