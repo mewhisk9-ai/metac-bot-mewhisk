@@ -40,7 +40,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 FREE_DEFAULT    = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"  # Strong reasoner — main forecasting
 FREE_PARSER     = "openrouter/openai/gpt-oss-120b"                     # Fast & reliable — structured output
 FREE_SUMMARIZER = "openrouter/openai/gpt-oss-20b"                      # Capable general model
-FREE_RESEARCHER = "openrouter/openai/gpt-4o:free"                      # Good for research synthesis
+FREE_RESEARCHER = "openrouter/free"                      # Good for research synthesis
 
 # Committee of 3 diverse free models for ensemble forecasting
 FREE_COMMITTEE = [
@@ -324,7 +324,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
     )
 
     try:
