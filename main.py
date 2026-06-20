@@ -1,3 +1,5 @@
+# main.py
+# mewhisk — Conservative Forecasting Bot (OpenRouter Free Models)
 
 import argparse
 import asyncio
@@ -17,6 +19,7 @@ from forecasting_tools import (
     NumericQuestion,
     Percentile,
     BinaryPrediction,
+    PredictedOption,
     PredictedOptionList,
     ReasonedPrediction,
     clean_indents,
@@ -53,16 +56,37 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("ConservativeHybridBot")
+logger = logging.getLogger("mewhisk")
 
 
-class ConservativeHybridBot(ForecastBot):
+def _is_child_question(question: MetaculusQuestion) -> bool:
+    """
+    Returns True if this question is a child/sub-question of a group.
+    Child questions should be skipped — the parent handles aggregation on Metaculus.
+    """
+    try:
+        # forecasting-tools exposes group_id or parent_id on sub-questions
+        if getattr(question, "group_id", None) is not None:
+            return True
+        if getattr(question, "parent_id", None) is not None:
+            return True
+        # Some versions nest it under question_type or type
+        qtype = str(getattr(question, "question_type", "") or "").lower()
+        if qtype in ("group", "conditional", "sub_question"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class mewhisk(ForecastBot):
     """
     Conservative forecasting bot using:
     - Research: Tavily + LLM researcher (OpenRouter free)
     - Models: Nemotron 120B, GPT-OSS 120B, GPT-OSS 20B (via OpenRouter)
     - Aggregation: Median across 3 forecasts
     - Compliance: structure_output + NumericDistribution.from_question()
+    - Child/parent: skips child questions automatically
     """
 
     _max_concurrent_questions = 1
@@ -93,6 +117,11 @@ class ConservativeHybridBot(ForecastBot):
             return f"Tavily failed: {e}"
 
     async def run_research(self, question: MetaculusQuestion) -> str:
+        # Skip research for child questions
+        if _is_child_question(question):
+            logger.info("Skipping research for child question: %s", getattr(question, "question_text", "")[:80])
+            return ""
+
         async with self._concurrency_limiter:
             loop = asyncio.get_running_loop()
             tasks = {
@@ -188,6 +217,10 @@ class ConservativeHybridBot(ForecastBot):
         return result, reasoning
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
+        if _is_child_question(question):
+            logger.info("Skipping child binary question: %s", getattr(question, "question_text", "")[:80])
+            return ReasonedPrediction(prediction_value=0.5, reasoning="Skipped: child question")
+
         forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
             pred, reason = await self._single_forecast(question, research, model_override=model)
@@ -196,25 +229,61 @@ class ConservativeHybridBot(ForecastBot):
         return ReasonedPrediction(prediction_value=float(np.median(forecasts)), reasoning=" | ".join(reasonings))
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
+        if _is_child_question(question):
+            logger.info("Skipping child MC question: %s", getattr(question, "question_text", "")[:80])
+            n = len(question.options)
+            return ReasonedPrediction(
+                prediction_value=PredictedOptionList(predicted_options=[
+                    PredictedOption(option_name=opt, probability=1.0/n)
+                    for opt in question.options
+                ]),
+                reasoning="Skipped: child question"
+            )
+
         forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
             pred, reason = await self._single_forecast(question, research, model_override=model)
             forecasts.append(pred)
             reasonings.append(reason)
-        # Use attribute access — PredictedOption is a Pydantic model, not a dict
-        all_probs = np.array([[opt.probability for opt in f.predicted_options] for f in forecasts])
-        median_probs = np.median(all_probs, axis=0)
-        if median_probs.sum() > 0:
-            median_probs = median_probs / median_probs.sum()
-        else:
-            median_probs = np.full_like(median_probs, 1.0 / len(median_probs))
-        options = forecasts[0].predicted_options
-        median_forecast = PredictedOptionList([
-            {"option_name": opt.option_name, "probability": float(p)} for opt, p in zip(options, median_probs)
+
+        option_list = list(question.options)
+
+        # Build per-model probability maps — PredictedOption is Pydantic, use attribute access
+        per_model_maps = []
+        for f in forecasts:
+            mapped = {}
+            for o in (getattr(f, "predicted_options", []) or []):
+                name = getattr(o, "option_name", None)
+                prob = getattr(o, "probability", 0.0)
+                if name is not None:
+                    mapped[str(name)] = max(0.0, float(prob))
+            for opt in option_list:
+                mapped.setdefault(opt, 0.0)
+            s = sum(mapped.values()) or 1.0
+            per_model_maps.append({k: v / s for k, v in mapped.items()})
+
+        mat = np.array([[m[opt] for opt in option_list] for m in per_model_maps], dtype=float)
+        median_probs = np.median(mat, axis=0)
+        median_probs = np.maximum(median_probs, 1e-6)
+        median_probs = median_probs / median_probs.sum()
+
+        median_forecast = PredictedOptionList(predicted_options=[
+            PredictedOption(option_name=opt, probability=float(p))
+            for opt, p in zip(option_list, median_probs)
         ])
         return ReasonedPrediction(prediction_value=median_forecast, reasoning=" | ".join(reasonings))
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        if _is_child_question(question):
+            logger.info("Skipping child numeric question: %s", getattr(question, "question_text", "")[:80])
+            return ReasonedPrediction(
+                prediction_value=NumericDistribution.from_question(
+                    [Percentile(percentile=p, value=0.0) for p in [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]],
+                    question
+                ),
+                reasoning="Skipped: child question"
+            )
+
         forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
             pred, reason = await self._single_forecast(question, research, model_override=model)
@@ -242,7 +311,7 @@ class ConservativeHybridBot(ForecastBot):
 # Entrypoint — Tournament Only
 # -----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Conservative Hybrid Bot.")
+    parser = argparse.ArgumentParser(description="Run mewhisk.")
     parser.add_argument(
         "--tournament-ids",
         nargs="+",
@@ -251,7 +320,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    bot = ConservativeHybridBot(
+    bot = mewhisk(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
