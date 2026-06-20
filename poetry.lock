@@ -4622,6 +4622,23 @@ snowflake = ["snowflake-connector-python (>=3.3.0) ; python_version < \"3.12\"",
 sql = ["SQLAlchemy (>=2.0.0)"]
 
 [[package]]
+name = "tavily-python"
+version = "0.7.26"
+description = "Python wrapper for the Tavily API"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "tavily_python-0.7.26-py3-none-any.whl", hash = "sha256:9b9e7f2d10b3572444e13e9a3bf4f5341975d591cbc1306be04ef89a363e42a7"},
+    {file = "tavily_python-0.7.26.tar.gz", hash = "sha256:36202728144fce1ef0cece33800f98e3cdeb5f600e6678c50b1232b866a2f509"},
+]
+
+[package.dependencies]
+httpx = "*"
+requests = "*"
+tiktoken = ">=0.5.1"
+
+[[package]]
 name = "tenacity"
 version = "9.1.2"
 description = "Retry code until it succeeds"
@@ -5191,4 +5208,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "837568545bbb9f5e14d4a5615539e22c2468998b3cb1e3c57b8d68191a7ad686"
+content-hash = "b2282c7fc5b44b5fe55ba110f3ffe20299a7134f203acafb299d57b2b0eca7e2"
