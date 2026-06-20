@@ -4,10 +4,8 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Literal
 
 import numpy as np
-import requests
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -36,10 +34,10 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # Free Model IDs (OpenRouter)
 # Slugs can change — verify at openrouter.ai/models
 # -----------------------------
-FREE_DEFAULT    = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"          # Strong reasoner — main forecasting
-FREE_PARSER     = "openrouter/openai/gpt-oss-120b"  # Fast & reliable — structured output
-FREE_SUMMARIZER = "openrouter/openai/gpt-oss-20b"           # Capable general model
-FREE_RESEARCHER = "openrouter/openai/gpt-4o:free"                  # Good for research synthesis
+FREE_DEFAULT    = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"  # Strong reasoner — main forecasting
+FREE_PARSER     = "openrouter/openai/gpt-oss-120b"                     # Fast & reliable — structured output
+FREE_SUMMARIZER = "openrouter/openai/gpt-oss-20b"                      # Capable general model
+FREE_RESEARCHER = "openrouter/openai/gpt-4o:free"                      # Good for research synthesis
 
 # Committee of 3 diverse free models for ensemble forecasting
 FREE_COMMITTEE = [
@@ -62,7 +60,7 @@ class ConservativeHybridBot(ForecastBot):
     """
     Conservative forecasting bot using:
     - Research: Tavily + LLM researcher (OpenRouter free)
-    - Models: DeepSeek R1, DeepSeek V3, Llama 3.3 70B (all free via OpenRouter)
+    - Models: Nemotron 120B, GPT-OSS 120B, GPT-OSS 20B (via OpenRouter)
     - Aggregation: Median across 3 forecasts
     - Compliance: structure_output + NumericDistribution.from_question()
     """
@@ -86,14 +84,13 @@ class ConservativeHybridBot(ForecastBot):
     # Multi-Source Research
     # -----------------------------
     def call_tavily(self, query: str) -> str:
-        if not self.tavily_client.api_key: return ""
+        if not self.tavily_client.api_key:
+            return ""
         try:
             response = self.tavily_client.search(query=query, search_depth="advanced")
             return "\n".join([f"- {c['content']}" for c in response['results']])
-        except Exception as e: return f"Tavily failed: {e}"
-
-    def call_newsapi(self, query: str) -> str:
-        return ""  # newsapi-python not installed; skipped
+        except Exception as e:
+            return f"Tavily failed: {e}"
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
@@ -185,30 +182,27 @@ class ConservativeHybridBot(ForecastBot):
             result = NumericDistribution.from_question(percentile_list, question)
 
         if model_override:
-            # Restore defaults
             self._llms["default"] = GeneralLlm(model=FREE_DEFAULT)
             self._llms["parser"]  = GeneralLlm(model=FREE_PARSER)
 
         return result, reasoning
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        forecasts = []
-        reasonings = []
+        forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
             pred, reason = await self._single_forecast(question, research, model_override=model)
             forecasts.append(pred)
             reasonings.append(reason)
-        median_pred = float(np.median(forecasts))
-        return ReasonedPrediction(prediction_value=median_pred, reasoning=" | ".join(reasonings))
+        return ReasonedPrediction(prediction_value=float(np.median(forecasts)), reasoning=" | ".join(reasonings))
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
-        forecasts = []
-        reasonings = []
+        forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
             pred, reason = await self._single_forecast(question, research, model_override=model)
             forecasts.append(pred)
             reasonings.append(reason)
-        all_probs = np.array([[opt["probability"] for opt in f.predicted_options] for f in forecasts])
+        # Use attribute access — PredictedOption is a Pydantic model, not a dict
+        all_probs = np.array([[opt.probability for opt in f.predicted_options] for f in forecasts])
         median_probs = np.median(all_probs, axis=0)
         if median_probs.sum() > 0:
             median_probs = median_probs / median_probs.sum()
@@ -216,13 +210,12 @@ class ConservativeHybridBot(ForecastBot):
             median_probs = np.full_like(median_probs, 1.0 / len(median_probs))
         options = forecasts[0].predicted_options
         median_forecast = PredictedOptionList([
-            {"option": opt["option"], "probability": float(p)} for opt, p in zip(options, median_probs)
+            {"option_name": opt.option_name, "probability": float(p)} for opt, p in zip(options, median_probs)
         ])
         return ReasonedPrediction(prediction_value=median_forecast, reasoning=" | ".join(reasonings))
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        forecasts = []
-        reasonings = []
+        forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
             pred, reason = await self._single_forecast(question, research, model_override=model)
             forecasts.append(pred)
@@ -238,10 +231,11 @@ class ConservativeHybridBot(ForecastBot):
                         break
                 else:
                     values.append(0.0)
-            median_val = float(np.median(values))
-            aggregated.append(Percentile(percentile=p, value=median_val))
-        distribution = NumericDistribution.from_question(aggregated, question)
-        return ReasonedPrediction(prediction_value=distribution, reasoning=" | ".join(reasonings))
+            aggregated.append(Percentile(percentile=p, value=float(np.median(values))))
+        return ReasonedPrediction(
+            prediction_value=NumericDistribution.from_question(aggregated, question),
+            reasoning=" | ".join(reasonings)
+        )
 
 
 # -----------------------------
