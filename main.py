@@ -52,6 +52,10 @@ FREE_COMMITTEE = [
 # Research is considered "failed" if shorter than this
 RESEARCH_MIN_CHARS = 150
 
+# Timeouts
+RESEARCH_TIMEOUT_S = float(os.getenv("RESEARCH_TIMEOUT_S", "45"))  # per research source
+LLM_TIMEOUT_S      = float(os.getenv("LLM_TIMEOUT_S",      "90"))  # per committee model
+
 # -----------------------------
 # Logging setup
 # -----------------------------
@@ -140,17 +144,26 @@ class mewhisk(ForecastBot):
             logger.info("Skipping research for child question: %s", getattr(question, "question_text", "")[:80])
             return ""
 
+        async def _safe(label: str, coro) -> str:
+            try:
+                result = await asyncio.wait_for(coro, timeout=RESEARCH_TIMEOUT_S)
+                return result if isinstance(result, str) else str(result)
+            except asyncio.TimeoutError:
+                logger.warning("Research timeout (%ss): %s", RESEARCH_TIMEOUT_S, label)
+                return f"({label} timed out)"
+            except Exception as exc:
+                logger.warning("Research error %s: %s", label, exc)
+                return f"({label} error: {exc})"
+
         async with self._concurrency_limiter:
             loop = asyncio.get_running_loop()
-            tasks = {
-                "tavily": loop.run_in_executor(None, self.call_tavily, question.question_text),
-                "llm":    self.get_llm("researcher", "llm").invoke(question.question_text),
-            }
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            raw_research = ""
-            for i, result in enumerate(results):
-                raw_research += f"--- SOURCE {list(tasks.keys())[i].upper()} ---\n{result}\n\n"
+            tavily_result = await _safe("tavily", loop.run_in_executor(None, self.call_tavily, question.question_text))
+            llm_result    = await _safe("llm",    self.get_llm("researcher", "llm").invoke(question.question_text))
 
+            raw_research = (
+                f"--- SOURCE TAVILY ---\n{tavily_result}\n\n"
+                f"--- SOURCE LLM ---\n{llm_result}\n\n"
+            )
             if not _research_ok(raw_research):
                 logger.warning("Research insufficient for Q: %s", getattr(question, "question_text", "")[:80])
             return raw_research
@@ -258,9 +271,21 @@ class mewhisk(ForecastBot):
 
         forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
-            pred, reason = await self._single_forecast(question, research, model_override=model)
-            forecasts.append(pred)
-            reasonings.append(reason)
+            try:
+                pred, reason = await asyncio.wait_for(
+                    self._single_forecast(question, research, model_override=model),
+                    timeout=LLM_TIMEOUT_S
+                )
+                forecasts.append(pred)
+                reasonings.append(reason)
+            except asyncio.TimeoutError:
+                logger.warning("Binary committee timeout: %s — skipping", model)
+            except Exception as exc:
+                logger.warning("Binary committee error: %s — %s", model, exc)
+
+        if not forecasts:
+            logger.error("All committee models failed/timed out — returning 0.5")
+            return ReasonedPrediction(prediction_value=0.5, reasoning="All models failed")
 
         p_final = float(np.median(forecasts))
 
@@ -285,9 +310,28 @@ class mewhisk(ForecastBot):
 
         forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
-            pred, reason = await self._single_forecast(question, research, model_override=model)
-            forecasts.append(pred)
-            reasonings.append(reason)
+            try:
+                pred, reason = await asyncio.wait_for(
+                    self._single_forecast(question, research, model_override=model),
+                    timeout=LLM_TIMEOUT_S
+                )
+                forecasts.append(pred)
+                reasonings.append(reason)
+            except asyncio.TimeoutError:
+                logger.warning("MC committee timeout: %s — skipping", model)
+            except Exception as exc:
+                logger.warning("MC committee error: %s — %s", model, exc)
+
+        if not forecasts:
+            logger.error("All MC committee models failed/timed out — returning uniform")
+            n0 = len(question.options)
+            return ReasonedPrediction(
+                prediction_value=PredictedOptionList(predicted_options=[
+                    PredictedOption(option_name=opt, probability=1.0/n0)
+                    for opt in question.options
+                ]),
+                reasoning="All models failed"
+            )
 
         option_list = list(question.options)
         n = len(option_list)
@@ -337,9 +381,21 @@ class mewhisk(ForecastBot):
 
         forecasts, reasonings = [], []
         for model in FREE_COMMITTEE:
-            pred, reason = await self._single_forecast(question, research, model_override=model)
-            forecasts.append(pred)
-            reasonings.append(reason)
+            try:
+                pred, reason = await asyncio.wait_for(
+                    self._single_forecast(question, research, model_override=model),
+                    timeout=LLM_TIMEOUT_S
+                )
+                forecasts.append(pred)
+                reasonings.append(reason)
+            except asyncio.TimeoutError:
+                logger.warning("Numeric committee timeout: %s — skipping", model)
+            except Exception as exc:
+                logger.warning("Numeric committee error: %s — %s", model, exc)
+
+        if not forecasts:
+            logger.error("All numeric committee models failed/timed out")
+            raise RuntimeError("All committee models timed out or failed for numeric question")
 
         target_percentiles = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
         aggregated = []
