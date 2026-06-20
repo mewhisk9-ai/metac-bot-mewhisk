@@ -377,7 +377,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
     )
 
     try:
