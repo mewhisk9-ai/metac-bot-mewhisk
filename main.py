@@ -1,3 +1,5 @@
+# main.py
+# Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only (Free Models)
 
 import argparse
 import asyncio
@@ -26,20 +28,18 @@ from forecasting_tools import (
 )
 
 from tavily import TavilyClient
-from newsapi import NewsApiClient
 
 # -----------------------------
 # Environment & API Keys
 # -----------------------------
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
 
 # -----------------------------
 # Free Model IDs (OpenRouter)
 # Slugs can change — verify at openrouter.ai/models
 # -----------------------------
 FREE_DEFAULT    = "openrouter/deepseek/deepseek-r1:free"          # Strong reasoner — main forecasting
-FREE_PARSER     = "openrouter/openai/gpt-oss-120b"  # Fast & reliable — structured output
+FREE_PARSER     = "openrouter/meta-llama/llama-3.3-70b-instruct:free"  # Fast & reliable — structured output
 FREE_SUMMARIZER = "openrouter/deepseek/deepseek-v3:free"           # Capable general model
 FREE_RESEARCHER = "openrouter/openai/gpt-4o:free"                  # Good for research synthesis
 
@@ -47,7 +47,7 @@ FREE_RESEARCHER = "openrouter/openai/gpt-4o:free"                  # Good for re
 FREE_COMMITTEE = [
     "openrouter/deepseek/deepseek-r1:free",
     "openrouter/deepseek/deepseek-v3:free",
-    "openrouter/free",
+    "openrouter/meta-llama/llama-3.3-70b-instruct:free",
 ]
 
 # -----------------------------
@@ -63,7 +63,7 @@ logger = logging.getLogger("ConservativeHybridBot")
 class ConservativeHybridBot(ForecastBot):
     """
     Conservative forecasting bot using:
-    - Research: Tavily + NewsAPI + GPT-4o free (OpenRouter)
+    - Research: Tavily + LLM researcher (OpenRouter free)
     - Models: DeepSeek R1, DeepSeek V3, Llama 3.3 70B (all free via OpenRouter)
     - Aggregation: Median across 3 forecasts
     - Compliance: structure_output + NumericDistribution.from_question()
@@ -83,7 +83,6 @@ class ConservativeHybridBot(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
 
     # -----------------------------
     # Multi-Source Research
@@ -96,20 +95,14 @@ class ConservativeHybridBot(ForecastBot):
         except Exception as e: return f"Tavily failed: {e}"
 
     def call_newsapi(self, query: str) -> str:
-        if not self.newsapi_client.api_key: return ""
-        try:
-            articles = self.newsapi_client.get_everything(q=query, language='en', sort_by='relevancy', page_size=5)
-            if not articles or not articles.get('articles'): return ""
-            return "\n".join([f"- Title: {a['title']}\n  Snippet: {a.get('description', 'N/A')}" for a in articles['articles']])
-        except Exception as e: return f"NewsAPI failed: {e}"
+        return ""  # newsapi-python not installed; skipped
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             loop = asyncio.get_running_loop()
             tasks = {
-                "tavily":  loop.run_in_executor(None, self.call_tavily, question.question_text),
-                "newsapi": loop.run_in_executor(None, self.call_newsapi, question.question_text),
-                "llm":     self.get_llm("researcher", "llm").invoke(question.question_text),
+                "tavily": loop.run_in_executor(None, self.call_tavily, question.question_text),
+                "llm":    self.get_llm("researcher", "llm").invoke(question.question_text),
             }
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
             raw_research = ""
