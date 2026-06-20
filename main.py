@@ -1,5 +1,3 @@
-# main.py
-# Conservative Hybrid Forecasting Bot — Tournament-Only, OpenRouter-Only (Free Models)
 
 import argparse
 import asyncio
@@ -38,16 +36,16 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # Free Model IDs (OpenRouter)
 # Slugs can change — verify at openrouter.ai/models
 # -----------------------------
-FREE_DEFAULT    = "openrouter/deepseek/deepseek-r1:free"          # Strong reasoner — main forecasting
-FREE_PARSER     = "openrouter/meta-llama/llama-3.3-70b-instruct:free"  # Fast & reliable — structured output
-FREE_SUMMARIZER = "openrouter/deepseek/deepseek-v3:free"           # Capable general model
+FREE_DEFAULT    = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"          # Strong reasoner — main forecasting
+FREE_PARSER     = "openrouter/openai/gpt-oss-120b"  # Fast & reliable — structured output
+FREE_SUMMARIZER = "openrouter/openai/gpt-oss-20b"           # Capable general model
 FREE_RESEARCHER = "openrouter/openai/gpt-4o:free"                  # Good for research synthesis
 
 # Committee of 3 diverse free models for ensemble forecasting
 FREE_COMMITTEE = [
-    "openrouter/deepseek/deepseek-r1:free",
-    "openrouter/deepseek/deepseek-v3:free",
-    "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+    "openrouter/openai/gpt-oss-120b",
+    "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+    "openrouter/openai/gpt-oss-20b",
 ]
 
 # -----------------------------
