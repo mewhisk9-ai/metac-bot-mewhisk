@@ -1,11 +1,21 @@
 # main.py
 # mewhisk — Conservative Forecasting Bot (Vultr Serverless Inference)
+#
+# Improvements:
+# 2) Recency-weighted research for near-term questions
+# 3) Question decomposition for complex multi-part questions
+# 4) Calibration / extremization from past resolutions
+# 5) Prediction-market cross-checks (Polymarket + Manifold)
+# 6) Persist per-model forecasts + accuracy weighting
+# 7) Vultr rate limits / retries
+# 8) RAG over past bot rationales
 
 import argparse
 import asyncio
 import logging
 import os
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 from dotenv import load_dotenv
@@ -28,6 +38,14 @@ from forecasting_tools import (
 )
 from tavily import TavilyClient
 
+from bot_helpers.calibration import CalibrationStore, apply_binary_calibration
+from bot_helpers.decomposition import maybe_decompose_question
+from bot_helpers.markets import blend_binary_with_markets, fetch_market_crosschecks
+from bot_helpers.model_memory import ModelMemoryStore, serialize_prediction
+from bot_helpers.rate_limit import VULTR_LIMITER
+from bot_helpers.rationale_rag import RationaleStore
+from bot_helpers.recency import days_until_resolution, recency_instruction, recency_time_range
+
 load_dotenv()
 
 # -----------------------------
@@ -45,14 +63,12 @@ VULTR_BASE_URL = os.getenv(
 # -----------------------------
 # Vultr Serverless Inference models
 # Catalog: https://api.vultrinference.com/v1/models (requires API key)
-# Docs: https://docs.vultr.com/products/compute/serverless-inference/faq
 # -----------------------------
 VULTR_DEFAULT = os.getenv("VULTR_MODEL_DEFAULT", "llama-3.3-70b-instruct-fp8")
 VULTR_PARSER = os.getenv("VULTR_MODEL_PARSER", "qwen2.5-32b-instruct")
 VULTR_SUMMARIZER = os.getenv("VULTR_MODEL_SUMMARIZER", "mistral-nemo-instruct-2407")
 VULTR_RESEARCHER = os.getenv("VULTR_MODEL_RESEARCHER", "llama-3.3-70b-instruct-fp8")
 
-# Diverse committee across model families for ensemble forecasting
 VULTR_COMMITTEE = [
     m.strip()
     for m in os.getenv(
@@ -68,16 +84,26 @@ VULTR_COMMITTEE = [
     if m.strip()
 ]
 
-# Research is considered "failed" if shorter than this
 RESEARCH_MIN_CHARS = 150
-
-# Timeouts
 RESEARCH_TIMEOUT_S = float(os.getenv("RESEARCH_TIMEOUT_S", "45"))
 LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "120"))
+MARKET_BLEND_WEIGHT = float(os.getenv("MARKET_BLEND_WEIGHT", "0.2"))
+ENABLE_DECOMPOSITION = os.getenv("ENABLE_DECOMPOSITION", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ENABLE_MARKET_CROSSCHECK = os.getenv("ENABLE_MARKET_CROSSCHECK", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+ENABLE_RATIONALE_RAG = os.getenv("ENABLE_RATIONALE_RAG", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
-# -----------------------------
-# Logging setup
-# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -108,12 +134,17 @@ def _vultr_llm(
         base_url=VULTR_BASE_URL,
         temperature=temperature,
         timeout=timeout or LLM_TIMEOUT_S,
-        allowed_tries=2,
+        allowed_tries=VULTR_LIMITER.allowed_tries,
     )
 
 
+async def _invoke_vultr(llm: GeneralLlm, prompt: str) -> str:
+    """Rate-limited Vultr invoke with retries handled by GeneralLlm."""
+    await VULTR_LIMITER.acquire()
+    return await llm.invoke(prompt)
+
+
 def _is_child_question(question: MetaculusQuestion) -> bool:
-    """Returns True if this is a sub-question of a group — skip these."""
     try:
         if getattr(question, "group_id", None) is not None:
             return True
@@ -128,18 +159,17 @@ def _is_child_question(question: MetaculusQuestion) -> bool:
 
 
 def _research_ok(research: str) -> bool:
-    """Returns True if research has enough content to be useful."""
     return bool(research) and len(research.strip()) >= RESEARCH_MIN_CHARS
 
 
 def _research_instruction(research: str) -> str:
-    """Returns the research grounding instruction to inject into prompts."""
     if _research_ok(research):
         return (
             "You MUST ground your probability estimate in the research below. "
             "For each option/outcome, cite at least one specific fact from the research "
             "that supports or undermines it. If the research contradicts your prior, "
-            "update toward the research."
+            "update toward the research. Use market cross-checks as noisy priors only "
+            "when resolution criteria appear aligned."
         )
     return (
         "WARNING: Research is unavailable or returned no useful content. "
@@ -148,25 +178,20 @@ def _research_instruction(research: str) -> str:
     )
 
 
-def _extremize_binary(p: float, strength: float = 1.35) -> float:
-    """
-    Mildly push forecasts away from 0.5 after committee aggregation.
-    Ensemble medians are often underconfident; this recovers some sharpness
-    while keeping hard clamps at [0.01, 0.99].
-    """
-    p = float(np.clip(p, 1e-6, 1 - 1e-6))
-    odds = (p / (1 - p)) ** strength
-    return float(np.clip(odds / (1 + odds), 0.01, 0.99))
+def _question_id(question: MetaculusQuestion) -> Any:
+    return (
+        getattr(question, "id_of_question", None)
+        or getattr(question, "id_of_post", None)
+        or getattr(question, "page_url", None)
+        or question.question_text[:80]
+    )
 
 
 class mewhisk(ForecastBot):
     """
-    Conservative forecasting bot using:
-    - Research: Tavily + Vultr LLM researcher
-    - Models: Vultr Serverless Inference (Llama / Qwen / DeepSeek committee)
-    - Aggregation: Median across committee, then mild binary extremization
-    - Research grounding: prompts require citing research; failed research widens priors
-    - Child/parent: skips child questions automatically
+    Conservative forecasting bot using Vultr Inference plus:
+    recency-weighted research, decomposition, calibration, market cross-checks,
+    per-model memory/weights, rate limiting, and rationale RAG.
     """
 
     _max_concurrent_questions = 1
@@ -181,22 +206,42 @@ class mewhisk(ForecastBot):
         }
 
     def __init__(self, *args, **kwargs):
-        # Ensure Vultr key exists before ForecastBot builds default LLMs
         _require_vultr_key()
         if "llms" not in kwargs or kwargs["llms"] is None:
             kwargs["llms"] = self._llm_config_defaults()
+        if "folder_to_save_reports_to" not in kwargs:
+            kwargs["folder_to_save_reports_to"] = os.getenv(
+                "REPORTS_FOLDER", "data/reports"
+            )
         super().__init__(*args, **kwargs)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+        self.calibration = CalibrationStore()
+        self.model_memory = ModelMemoryStore()
+        self.rationale_store = RationaleStore()
 
     # -----------------------------
     # Multi-Source Research
     # -----------------------------
-    def call_tavily(self, query: str) -> str:
+    def call_tavily(self, query: str, time_range: str | None = None) -> str:
         if not self.tavily_client.api_key:
             return ""
         try:
-            response = self.tavily_client.search(query=query, search_depth="advanced")
-            return "\n".join([f"- {c['content']}" for c in response["results"]])
+            kwargs: dict[str, Any] = {
+                "query": query,
+                "search_depth": "advanced",
+                "max_results": 8,
+            }
+            if time_range:
+                kwargs["time_range"] = time_range
+                kwargs["topic"] = "news"
+            response = self.tavily_client.search(**kwargs)
+            lines = []
+            for c in response.get("results") or []:
+                title = c.get("title") or ""
+                content = c.get("content") or ""
+                url = c.get("url") or ""
+                lines.append(f"- {title}: {content}" + (f" ({url})" if url else ""))
+            return "\n".join(lines)
         except Exception as e:
             return f"Tavily failed: {e}"
 
@@ -219,12 +264,22 @@ class mewhisk(ForecastBot):
                 logger.warning("Research error %s: %s", label, exc)
                 return f"({label} error: {exc})"
 
+        time_range = recency_time_range(question)
+        days = days_until_resolution(question)
+        recency_note = recency_instruction(question)
+        logger.info(
+            "Research recency: days_until=%s time_range=%s",
+            f"{days:.0f}" if days is not None else "?",
+            time_range,
+        )
+
         research_prompt = clean_indents(
             f"""
             You are a research assistant for a superforecaster.
             Summarize the most decision-relevant facts for this question.
             Prefer base rates, recent developments, resolution criteria traps,
             and arguments for YES and NO (or each option).
+            {recency_note}
             Do not produce a final probability.
 
             Question: {question.question_text}
@@ -237,19 +292,81 @@ class mewhisk(ForecastBot):
 
         async with self._concurrency_limiter:
             loop = asyncio.get_running_loop()
-            tavily_result = await _safe(
-                "tavily",
-                loop.run_in_executor(None, self.call_tavily, question.question_text),
-            )
-            llm_result = await _safe(
-                "llm",
-                self.get_llm("researcher", "llm").invoke(research_prompt),
+
+            async def _tavily():
+                return await loop.run_in_executor(
+                    None,
+                    lambda: self.call_tavily(
+                        question.question_text, time_range=time_range
+                    ),
+                )
+
+            async def _llm_research():
+                return await _invoke_vultr(
+                    self.get_llm("researcher", "llm"), research_prompt
+                )
+
+            async def _markets():
+                if not ENABLE_MARKET_CROSSCHECK:
+                    return ""
+                return await loop.run_in_executor(
+                    None, fetch_market_crosschecks, question.question_text
+                )
+
+            async def _decompose():
+                if not ENABLE_DECOMPOSITION:
+                    return ""
+
+                async def _inv(prompt: str) -> str:
+                    return await _invoke_vultr(
+                        self.get_llm("researcher", "llm"), prompt
+                    )
+
+                return await maybe_decompose_question(question, _inv)
+
+            async def _rag():
+                if not ENABLE_RATIONALE_RAG:
+                    return ""
+                return self.rationale_store.format_context(question.question_text)
+
+            tavily_result, llm_result, market_block, decomp_block, rag_block = (
+                await asyncio.gather(
+                    _safe("tavily", _tavily()),
+                    _safe("llm", _llm_research()),
+                    _safe("markets", _markets()),
+                    _safe("decompose", _decompose()),
+                    _safe("rag", _rag()),
+                )
             )
 
-            raw_research = (
-                f"--- SOURCE TAVILY ---\n{tavily_result}\n\n"
-                f"--- SOURCE LLM ---\n{llm_result}\n\n"
-            )
+            # For near-term questions, also pull a broader historical pass
+            historical = ""
+            if time_range in {"week", "month"}:
+                historical = await _safe(
+                    "tavily_hist",
+                    loop.run_in_executor(
+                        None,
+                        lambda: self.call_tavily(
+                            question.question_text, time_range="year"
+                        ),
+                    ),
+                )
+
+            parts = [
+                f"--- RECENCY GUIDANCE ---\n{recency_note}\n",
+                f"--- SOURCE TAVILY ({time_range or 'unfiltered'}) ---\n{tavily_result}\n",
+            ]
+            if historical:
+                parts.append(f"--- SOURCE TAVILY (year baseline) ---\n{historical}\n")
+            parts.append(f"--- SOURCE LLM ---\n{llm_result}\n")
+            if market_block:
+                parts.append(market_block if market_block.endswith("\n") else market_block + "\n")
+            if decomp_block:
+                parts.append(decomp_block if decomp_block.endswith("\n") else decomp_block + "\n")
+            if rag_block:
+                parts.append(rag_block if rag_block.endswith("\n") else rag_block + "\n")
+
+            raw_research = "\n".join(parts)
             if not _research_ok(raw_research):
                 logger.warning(
                     "Research insufficient for Q: %s",
@@ -271,6 +388,7 @@ class mewhisk(ForecastBot):
 
         grounding = _research_instruction(research)
         research_block = research.strip() or "(no research available)"
+        recency_note = recency_instruction(question)
 
         if isinstance(question, BinaryQuestion):
             prompt = clean_indents(
@@ -282,6 +400,7 @@ class mewhisk(ForecastBot):
                 Resolution criteria: {question.resolution_criteria}
                 Fine print: {question.fine_print}
                 Today: {datetime.now().strftime("%Y-%m-%d")}
+                {recency_note}
 
                 {grounding}
 
@@ -292,12 +411,14 @@ class mewhisk(ForecastBot):
                 (a) Time until resolution
                 (b) Status quo (world changes slowly)
                 (c) Base rates — if research is missing, stay close to them
+                (d) Related market prices only if criteria align
 
                 Be humble. Avoid overconfidence.
                 End with: "Probability: ZZ%"
                 """
             )
-            reasoning = await forecaster.invoke(prompt)
+            reasoning = await _invoke_vultr(forecaster, prompt)
+            await VULTR_LIMITER.acquire()
             pred: BinaryPrediction = await structure_output(
                 reasoning, BinaryPrediction, model=parser
             )
@@ -313,6 +434,7 @@ class mewhisk(ForecastBot):
                 Background: {question.background_info}
                 Resolution: {question.resolution_criteria}
                 Today: {datetime.now().strftime("%Y-%m-%d")}
+                {recency_note}
 
                 {grounding}
 
@@ -324,7 +446,8 @@ class mewhisk(ForecastBot):
                 End with probabilities for each option in order.
                 """
             )
-            reasoning = await forecaster.invoke(prompt)
+            reasoning = await _invoke_vultr(forecaster, prompt)
+            await VULTR_LIMITER.acquire()
             result = await structure_output(
                 reasoning,
                 PredictedOptionList,
@@ -352,6 +475,7 @@ class mewhisk(ForecastBot):
                 {lower_msg}
                 {upper_msg}
                 Today: {datetime.now().strftime("%Y-%m-%d")}
+                {recency_note}
 
                 {grounding}
 
@@ -363,7 +487,8 @@ class mewhisk(ForecastBot):
                 Provide percentiles: 10, 20, 40, 60, 80, 90.
                 """
             )
-            reasoning = await forecaster.invoke(prompt)
+            reasoning = await _invoke_vultr(forecaster, prompt)
+            await VULTR_LIMITER.acquire()
             percentile_list: list[Percentile] = await structure_output(
                 reasoning, list[Percentile], model=parser
             )
@@ -375,7 +500,17 @@ class mewhisk(ForecastBot):
         return result, reasoning
 
     async def _committee_forecast(self, question: MetaculusQuestion, research: str):
-        """Run the model committee in parallel; skip failures."""
+        """Run the model committee in parallel; skip failures; persist forecasts."""
+
+        qtype = (
+            "binary"
+            if isinstance(question, BinaryQuestion)
+            else "multiple_choice"
+            if isinstance(question, MultipleChoiceQuestion)
+            else "numeric"
+            if isinstance(question, NumericQuestion)
+            else "other"
+        )
 
         async def _one(model_id: str):
             try:
@@ -383,6 +518,17 @@ class mewhisk(ForecastBot):
                     self._single_forecast(question, research, model_id),
                     timeout=LLM_TIMEOUT_S,
                 )
+                try:
+                    self.model_memory.record_forecast(
+                        question_id=_question_id(question),
+                        question_text=question.question_text,
+                        model_id=model_id,
+                        question_type=qtype,
+                        prediction=serialize_prediction(pred),
+                        reasoning=reason,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to persist model forecast: %s", exc)
                 return model_id, pred, reason
             except asyncio.TimeoutError:
                 logger.warning("Committee timeout: %s — skipping", model_id)
@@ -392,13 +538,32 @@ class mewhisk(ForecastBot):
                 return model_id, None, None
 
         results = await asyncio.gather(*[_one(m) for m in VULTR_COMMITTEE])
-        forecasts, reasonings = [], []
+        model_ids, forecasts, reasonings = [], [], []
         for model_id, pred, reason in results:
             if pred is None:
                 continue
+            model_ids.append(model_id)
             forecasts.append(pred)
             reasonings.append(f"[{model_id}] {reason}")
-        return forecasts, reasonings
+        return model_ids, forecasts, reasonings
+
+    def _remember_final(
+        self,
+        question: MetaculusQuestion,
+        prediction: Any,
+        reasoning: str,
+        question_type: str,
+    ) -> None:
+        try:
+            self.rationale_store.add(
+                question_id=_question_id(question),
+                question_text=question.question_text,
+                prediction=serialize_prediction(prediction),
+                reasoning=reasoning,
+                question_type=question_type,
+            )
+        except Exception as exc:
+            logger.warning("Failed to store rationale: %s", exc)
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
@@ -412,7 +577,9 @@ class mewhisk(ForecastBot):
                 prediction_value=0.5, reasoning="Skipped: child question"
             )
 
-        forecasts, reasonings = await self._committee_forecast(question, research)
+        model_ids, forecasts, reasonings = await self._committee_forecast(
+            question, research
+        )
 
         if not forecasts:
             logger.error("All committee models failed/timed out — returning 0.5")
@@ -420,18 +587,27 @@ class mewhisk(ForecastBot):
                 prediction_value=0.5, reasoning="All models failed"
             )
 
-        p_final = float(np.median(forecasts))
+        # Accuracy-weighted median across committee
+        try:
+            p_final = self.model_memory.weighted_median_binary(
+                model_ids, [float(f) for f in forecasts]
+            )
+        except Exception:
+            p_final = float(np.median(forecasts))
 
-        # If research failed, blend toward 0.5 to reflect higher uncertainty
         if not _research_ok(research):
             logger.warning("Research failed — blending binary forecast toward 0.5")
             p_final = 0.6 * p_final + 0.4 * 0.5
         else:
-            p_final = _extremize_binary(p_final)
+            p_final = apply_binary_calibration(p_final, self.calibration)
+            p_final = blend_binary_with_markets(
+                p_final, research, weight=MARKET_BLEND_WEIGHT
+            )
+            p_final = float(np.clip(p_final, 0.01, 0.99))
 
-        return ReasonedPrediction(
-            prediction_value=p_final, reasoning=" | ".join(reasonings)
-        )
+        reasoning = " | ".join(reasonings)
+        self._remember_final(question, p_final, reasoning, "binary")
+        return ReasonedPrediction(prediction_value=p_final, reasoning=reasoning)
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -452,7 +628,9 @@ class mewhisk(ForecastBot):
                 reasoning="Skipped: child question",
             )
 
-        forecasts, reasonings = await self._committee_forecast(question, research)
+        model_ids, forecasts, reasonings = await self._committee_forecast(
+            question, research
+        )
 
         if not forecasts:
             logger.error("All MC committee models failed/timed out — returning uniform")
@@ -471,7 +649,8 @@ class mewhisk(ForecastBot):
         n = len(option_list)
 
         per_model_maps = []
-        for f in forecasts:
+        kept_ids = []
+        for mid, f in zip(model_ids, forecasts):
             mapped = {}
             for o in getattr(f, "predicted_options", []) or []:
                 name = getattr(o, "option_name", None)
@@ -482,13 +661,18 @@ class mewhisk(ForecastBot):
                 mapped.setdefault(opt, 0.0)
             s = sum(mapped.values()) or 1.0
             per_model_maps.append({k: v / s for k, v in mapped.items()})
+            kept_ids.append(mid)
 
-        mat = np.array(
-            [[m[opt] for opt in option_list] for m in per_model_maps], dtype=float
-        )
-        median_probs = np.median(mat, axis=0)
-        median_probs = np.maximum(median_probs, 1e-6)
-        median_probs = median_probs / median_probs.sum()
+        vectors = [[m[opt] for opt in option_list] for m in per_model_maps]
+        try:
+            median_probs = np.array(
+                self.model_memory.weighted_mean_vector(kept_ids, vectors), dtype=float
+            )
+        except Exception:
+            mat = np.array(vectors, dtype=float)
+            median_probs = np.median(mat, axis=0)
+            median_probs = np.maximum(median_probs, 1e-6)
+            median_probs = median_probs / median_probs.sum()
 
         if not _research_ok(research):
             logger.warning("Research failed — blending MC forecast toward uniform")
@@ -502,8 +686,10 @@ class mewhisk(ForecastBot):
                 for opt, p in zip(option_list, median_probs)
             ]
         )
+        reasoning = " | ".join(reasonings)
+        self._remember_final(question, median_forecast, reasoning, "multiple_choice")
         return ReasonedPrediction(
-            prediction_value=median_forecast, reasoning=" | ".join(reasonings)
+            prediction_value=median_forecast, reasoning=reasoning
         )
 
     async def _run_forecast_on_numeric(
@@ -525,7 +711,9 @@ class mewhisk(ForecastBot):
                 reasoning="Skipped: child question",
             )
 
-        forecasts, reasonings = await self._committee_forecast(question, research)
+        _model_ids, forecasts, reasonings = await self._committee_forecast(
+            question, research
+        )
 
         if not forecasts:
             logger.error("All numeric committee models failed/timed out")
@@ -546,7 +734,6 @@ class mewhisk(ForecastBot):
                     values.append(0.0)
             aggregated.append(Percentile(percentile=p, value=float(np.median(values))))
 
-        # Widen intervals when research failed
         if not _research_ok(research) and len(aggregated) >= 2:
             mid = aggregated[len(aggregated) // 2].value
             widened = []
@@ -557,10 +744,10 @@ class mewhisk(ForecastBot):
                 )
             aggregated = widened
 
-        return ReasonedPrediction(
-            prediction_value=NumericDistribution.from_question(aggregated, question),
-            reasoning=" | ".join(reasonings),
-        )
+        dist = NumericDistribution.from_question(aggregated, question)
+        reasoning = " | ".join(reasonings)
+        self._remember_final(question, dist, reasoning, "numeric")
+        return ReasonedPrediction(prediction_value=dist, reasoning=reasoning)
 
 
 def _build_bot(*, publish: bool, skip_previous: bool) -> mewhisk:
@@ -569,12 +756,10 @@ def _build_bot(*, publish: bool, skip_previous: bool) -> mewhisk:
         predictions_per_research_report=1,
         publish_reports_to_metaculus=publish,
         skip_previously_forecasted_questions=skip_previous,
+        folder_to_save_reports_to=os.getenv("REPORTS_FOLDER", "data/reports"),
     )
 
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run mewhisk on Vultr Inference.")
     parser.add_argument(
@@ -603,7 +788,6 @@ if __name__ == "__main__":
     if args.mode == "test_questions":
         tournament_ids = [MetaculusApi.CURRENT_MINIBENCH_ID]
         skip_previous = False
-        # Do not publish test runs unless explicitly opted in
         publish = os.getenv("PUBLISH_TEST_QUESTIONS", "").lower() in {
             "1",
             "true",

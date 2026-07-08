@@ -40,6 +40,18 @@ Default Vultr models (override via env):
 - Summarizer: `mistral-nemo-instruct-2407`
 - Committee: Llama 3.3 70B + Qwen2.5 32B + DeepSeek R1 Distill Llama 70B
 
+## Bot improvements (mewhisk)
+`main.py` plus `bot_helpers/` implement:
+1. **Recency-weighted research** — near-term questions bias Tavily to `week`/`month` and add recency instructions
+2. **Question decomposition** — complex questions get sub-question breakdowns before forecasting
+3. **Calibration / extremization** — `data/calibration.json` fits logistic + strength from past resolutions
+4. **Market cross-checks** — Polymarket + Manifold related prices blended lightly into binary forecasts
+5. **Per-model memory** — `data/model_forecasts.jsonl` + accuracy-based weights in `data/model_weights.json`
+6. **Vultr rate limits** — token bucket (`VULTR_RPM` / `VULTR_BURST`) and retries (`VULTR_ALLOWED_TRIES`)
+7. **Rationale RAG** — TF-IDF retrieval over past rationales in `data/rationales.jsonl`
+
+Toggle features with `ENABLE_DECOMPOSITION`, `ENABLE_MARKET_CROSSCHECK`, `ENABLE_RATIONALE_RAG`.
+
 ## Changing the Github automation
 You can change which file is run in the GitHub automation by either changing the content of `main.py` to the contents of `main_with_no_framwork.py` (or another script) or by chaging all references to `main.py` to another script in `.github/workflows/run_bot_on_tournament.yaml` and related files.
 
