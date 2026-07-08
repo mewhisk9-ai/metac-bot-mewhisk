@@ -19,16 +19,26 @@ If you run into trouble, reach out to `ben [at] metaculus [.com]`
 The easiest way to use this repo is to fork it, enable github workflow/actions, and then set repository secrets. Then your bot will run every 30min, pick up new questions, and forecast on them. Automation is handled in the `.github/workflows/` folder. The `daily_run_simple_bot.yaml` file runs the simple bot every 30min and will skip questions it has already forecasted on.
 
 1) **Fork the repository**: Go to the [repository](https://github.com/Metaculus/metac-bot-template) and click 'fork'.
-2) **Set secrets**: Go to `Settings -> Secrets and variables -> Actions -> New repository secret` and set API keys/Tokens as secrets. You will want to set your METACULUS_TOKEN and an OPENROUTER_API_KEY (or whatever LLM/search providers you plan to use). This will be used to post questions to Metaculus. Make sure to copy the name of these variables exactly (including all caps).
+2) **Set secrets**: Go to `Settings -> Secrets and variables -> Actions -> New repository secret` and set API keys/Tokens as secrets. You will want to set your `METACULUS_TOKEN` and a `VULTR_SERVERLESS_INFERENCE_API_KEY` (plus optional search keys like `TAVILY_API_KEY`). Make sure to copy the name of these variables exactly (including all caps).
    - You can create a METACULUS_TOKEN at https://metaculus.com/aib. If you get confused, please see the instructions on our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#creating-your-bot-account-and-metaculus-token) page.
-   - You can get an OPENROUTER_API_KEY with free credits by filling out this [form](https://forms.gle/aQdYMq9Pisrf1v7d8). If you don't want to wait or want to use more models than we provide, you can also make your own API key on OpenRouter's [website](https://openrouter.ai/). First, make an account, then go to your profile, then go to "keys", and then make a key. Please read our [documentation](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#can-i-get-free-search-and-llm-services) about our free credits
-   - Other LLM and Search providers should work out of the box (such as OPENAI_API_KEY, PERPLEXITY_API_KEY, ASKNEWS_SECRET, etc), though we recommend OpenRouter to start.
-4) **Enable Actions**: Go to 'Actions' then click 'Enable'. Then go to the 'Regularly forecast new questions' workflow, and click 'Enable'. To test if the workflow is working, click 'Run workflow', choose the main branch, then click the green 'Run workflow' button. This will check for new questions and forecast only on ones it has not yet successfully forecast on.
+   - This bot uses [Vultr Serverless Inference](https://www.vultr.com/products/cloud-inference/) (OpenAI-compatible). Create an Inference subscription in the Vultr console, copy the inference API key, and store it as `VULTR_SERVERLESS_INFERENCE_API_KEY`. Model IDs can be listed via `GET https://api.vultrinference.com/v1/models`.
+   - Optional search providers (Tavily, AskNews, Perplexity, Exa) improve research quality.
+3) **Enable Actions**: Go to 'Actions' then click 'Enable'. Then go to the 'Regularly forecast new questions' workflow, and click 'Enable'. To test if the workflow is working, click 'Run workflow', choose the main branch, then click the green 'Run workflow' button. This will check for new questions and forecast only on ones it has not yet successfully forecast on.
 
 The bot should just work as is at this point. You can disable the workflow by clicking `Actions > Regularly forecast new questions > Triple dots > disable workflow`
 
 ## API Keys
-Instructions for getting your METACULUS_TOKEN, OPENROUTER_API_KEY, or optional search provider API keys (AskNews, Exa, Perplexity, etc) are listed on the "Getting Started" section of the [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page.
+Required:
+- `METACULUS_TOKEN` — from https://metaculus.com/aib
+- `VULTR_SERVERLESS_INFERENCE_API_KEY` — from your Vultr Serverless Inference subscription
+
+Optional research / legacy keys (`TAVILY_API_KEY`, AskNews, Exa, Perplexity, OpenRouter) are listed on the "Getting Started" section of the [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page.
+
+Default Vultr models (override via env):
+- Default / researcher: `llama-3.3-70b-instruct-fp8`
+- Parser: `qwen2.5-32b-instruct`
+- Summarizer: `mistral-nemo-instruct-2407`
+- Committee: Llama 3.3 70B + Qwen2.5 32B + DeepSeek R1 Distill Llama 70B
 
 ## Changing the Github automation
 You can change which file is run in the GitHub automation by either changing the content of `main.py` to the contents of `main_with_no_framwork.py` (or another script) or by chaging all references to `main.py` to another script in `.github/workflows/run_bot_on_tournament.yaml` and related files.
