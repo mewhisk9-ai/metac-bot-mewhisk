@@ -1,6 +1,10 @@
 ###  Specific to Project ###
 benchmarks/
 sandbox.py
+data/*.json
+data/*.jsonl
+data/reports/
+!data/.gitkeep
 
 
 ### General gitignore ###
