@@ -39,7 +39,7 @@ jobs:
         run: poetry install --no-interaction --no-root
       - name: Run bot
         run: |
-          poetry run python main.py --tournament-ids 33022 33013 market-pulse-26q3
+          poetry run python main.py
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
