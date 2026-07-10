@@ -797,11 +797,7 @@ if __name__ == "__main__":
         if args.tournament_ids:
             tournament_ids = [str(tid) for tid in args.tournament_ids]
         else:
-            tournament_ids = [
-                str(MetaculusApi.CURRENT_AI_COMPETITION_ID),
-                str(MetaculusApi.CURRENT_MARKET_PULSE_ID),
-                str(MetaculusApi.CURRENT_MINIBENCH_ID),
-            ]
+            tournament_ids = list(DEFAULT_TOURNAMENT_IDS)
 
     bot = _build_bot(publish=publish, skip_previous=skip_previous)
 
