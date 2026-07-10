@@ -1,14 +1,6 @@
 # main.py
 # mewhisk — Conservative Forecasting Bot (Vultr Serverless Inference)
 #
-# Improvements:
-# 2) Recency-weighted research for near-term questions
-# 3) Question decomposition for complex multi-part questions
-# 4) Calibration / extremization from past resolutions
-# 5) Prediction-market cross-checks (Polymarket + Manifold)
-# 6) Persist per-model forecasts + accuracy weighting
-# 7) Vultr rate limits / retries
-# 8) RAG over past bot rationales
 
 import argparse
 import asyncio
