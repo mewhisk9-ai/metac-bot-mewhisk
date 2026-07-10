@@ -794,11 +794,14 @@ if __name__ == "__main__":
     elif args.mode == "metaculus_cup":
         tournament_ids = [str(MetaculusApi.CURRENT_METACULUS_CUP_ID)]
     else:
-        tournament_ids = args.tournament_ids or [
-            str(MetaculusApi.CURRENT_AI_COMPETITION_ID),
-            str(MetaculusApi.CURRENT_MARKET_PULSE_ID),
-            str(MetaculusApi.CURRENT_MINIBENCH_ID),
-        ]
+        if args.tournament_ids:
+            tournament_ids = [str(tid) for tid in args.tournament_ids]
+        else:
+            tournament_ids = [
+                str(MetaculusApi.CURRENT_AI_COMPETITION_ID),
+                str(MetaculusApi.CURRENT_MARKET_PULSE_ID),
+                str(MetaculusApi.CURRENT_MINIBENCH_ID),
+            ]
 
     bot = _build_bot(publish=publish, skip_previous=skip_previous)
 
