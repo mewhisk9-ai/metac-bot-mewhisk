@@ -752,6 +752,11 @@ def _build_bot(*, publish: bool, skip_previous: bool) -> mewhisk:
     )
 
 
+# -----------------------------
+# Entrypoint — Tournament Only
+# -----------------------------
+DEFAULT_TOURNAMENT_IDS = ["33022", "33013", "market-pulse-26q3"]
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run mewhisk on Vultr Inference.")
     parser.add_argument(
