@@ -51,6 +51,10 @@ VULTR_API_KEY = (
 VULTR_BASE_URL = os.getenv(
     "VULTR_INFERENCE_BASE_URL", "https://api.vultrinference.com/v1"
 )
+VULTR_OPENAI_PREFIX = os.getenv("VULTR_OPENAI_PREFIX", "openai")
+VULTR_OPENAI_COMPATIBLE_MODEL = os.getenv(
+    "VULTR_OPENAI_COMPATIBLE_MODEL", "gpt-4o-mini"
+)
 
 # -----------------------------
 # Vultr Serverless Inference models
@@ -113,6 +117,19 @@ def _require_vultr_key() -> str:
     return VULTR_API_KEY
 
 
+def _model_name_for_vultr(model_id: str) -> str:
+    """Return a provider-safe model identifier for the Vultr endpoint."""
+    if not model_id:
+        return VULTR_OPENAI_COMPATIBLE_MODEL
+    if model_id.startswith(("openai/", "anthropic/", "meta/", "gpt-")):
+        return model_id
+    if "/" in model_id:
+        return model_id
+    if VULTR_OPENAI_PREFIX == "openai":
+        return f"openai/{model_id}"
+    return f"{VULTR_OPENAI_PREFIX}/{model_id}"
+
+
 def _vultr_llm(
     model_id: str,
     *,
@@ -121,7 +138,7 @@ def _vultr_llm(
 ) -> GeneralLlm:
     """Build a GeneralLlm pointed at Vultr's OpenAI-compatible endpoint."""
     return GeneralLlm(
-        model=f"openai/{model_id}",
+        model=_model_name_for_vultr(model_id),
         api_key=_require_vultr_key(),
         base_url=VULTR_BASE_URL,
         temperature=temperature,
