@@ -120,11 +120,13 @@ def _require_vultr_key() -> str:
 def _model_name_for_vultr(model_id: str) -> str:
     """Return a provider-safe model identifier for the Vultr endpoint."""
     if not model_id:
-        return VULTR_OPENAI_COMPATIBLE_MODEL
-    if model_id.startswith(("openai/", "anthropic/", "meta/", "gpt-")):
+        model_id = VULTR_OPENAI_COMPATIBLE_MODEL
+    if model_id.startswith(("openai/", "anthropic/", "meta/")):
         return model_id
     if "/" in model_id:
         return model_id
+    if model_id.startswith(("gpt-", "o1", "o3", "o4")):
+        return f"openai/{model_id}"
     if VULTR_OPENAI_PREFIX == "openai":
         return f"openai/{model_id}"
     return f"{VULTR_OPENAI_PREFIX}/{model_id}"
@@ -137,14 +139,20 @@ def _vultr_llm(
     timeout: float | None = None,
 ) -> GeneralLlm:
     """Build a GeneralLlm pointed at Vultr's OpenAI-compatible endpoint."""
-    return GeneralLlm(
-        model=_model_name_for_vultr(model_id),
+    model_name = _model_name_for_vultr(model_id)
+    llm = GeneralLlm(
+        model=model_name,
         api_key=_require_vultr_key(),
         base_url=VULTR_BASE_URL,
         temperature=temperature,
         timeout=timeout or LLM_TIMEOUT_S,
         allowed_tries=VULTR_LIMITER.allowed_tries,
     )
+    # Preserve the provider-prefixed model name for litellm even though
+    # forecasting-tools strips prefixes internally for cost tracking.
+    llm.litellm_kwargs["model"] = model_name
+    llm._litellm_model = model_name
+    return llm
 
 
 async def _invoke_vultr(llm: GeneralLlm, prompt: str) -> str:
